@@ -1,4 +1,4 @@
-// Command morpheus-doctor diagnoses a local Morpheus proxy-router and, with --dev,
+// Command morctl diagnoses a local Morpheus proxy-router and, with --dev,
 // runs the full session -> inference handshake in one step so you never have to
 // copy-paste a session ID between commands.
 //
@@ -29,7 +29,7 @@ const (
 	defaultPrompt     = "Hello!"
 	defaultDuration   = 600 // seconds (10 minutes)
 	defaultCookie     = "./.cookie"
-	sessionCacheFile  = ".morpheus-doctor-session.json"
+	sessionCacheFile  = ".morctl-session.json"
 	lowMorWarningMOR  = 5.0 // heads-up threshold, not a hard block
 	sessionSafetyMarg = 30 * time.Second
 )
@@ -234,7 +234,7 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("morpheus-doctor  ->  %s\n", c.base)
+	fmt.Printf("morctl  ->  %s\n", c.base)
 
 	if err := c.reachable(); err != nil {
 		fmt.Println("✖ router not reachable")
@@ -276,7 +276,7 @@ type chatResp struct {
 	} `json:"choices"`
 }
 
-// sessionCache is the on-disk record of the last session morpheus-doctor opened,
+// sessionCache is the on-disk record of the last session morctl opened,
 // stored as a small JSON file next to the binary so --dev/--interactive can reuse
 // a still-live session across separate invocations instead of always opening (and
 // staking for) a new one.

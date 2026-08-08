@@ -1,6 +1,6 @@
-# `morpheus-doctor` — Design Notes
+# `morctl` — Design Notes
 
-Why `morpheus-doctor` exists and the decisions behind how it works. For usage,
+Why `morctl` exists and the decisions behind how it works. For usage,
 see [`README.md`](./README.md) — this file is the design record, not the
 manual.
 
@@ -9,7 +9,7 @@ manual.
 Manually testing inference against a Morpheus proxy-router meant three
 separate `curl` calls with a session ID hand-copied between them (see
 [`AUDIT.md`](../morpheus-internship/contributions/AUDIT.md), findings F3/F4).
-`morpheus-doctor` collapses that into one command.
+`morctl` collapses that into one command.
 
 ## Why Go
 
@@ -32,7 +32,7 @@ maintaining the full message history client-side and resending it every
 turn — see [Context handling](#context-handling).
 
 ```
-$ morpheus-doctor --dev --model kimi-k2.5 --prompt "Hello!"
+$ morctl --dev --model kimi-k2.5 --prompt "Hello!"
 ✔ router reachable
   wallet: 18.9442 MOR, 0.0021 ETH
 > opening session (model kimi-k2.5, 600s)...
@@ -46,7 +46,7 @@ $ morpheus-doctor --dev --model kimi-k2.5 --prompt "Hello!"
 ## Session caching
 
 `--dev`/`--interactive` write the opened session's ID, model, and expiry to
-`.morpheus-doctor-session.json` next to the binary. On the next run against
+`.morctl-session.json` next to the binary. On the next run against
 the same model, if that cached session still has enough time left (30s
 safety margin), it's reused instead of opening — and staking for — a new
 one. `--fresh` bypasses the cache unconditionally.
@@ -75,12 +75,12 @@ gap this addresses.
   setups but not yet wrapped by this tool.
 - Router API address: `--host` (default `localhost:8082`).
 - Headless wallet: `WALLET_PRIVATE_KEY` on the router side (falls back to
-  system keychain when unset) — `morpheus-doctor` doesn't touch the wallet
+  system keychain when unset) — `morctl` doesn't touch the wallet
   directly, it only talks to whatever router process is already running.
 
 ## Design decisions
 
-- **Router lifecycle:** `morpheus-doctor` assumes the router is already
+- **Router lifecycle:** `morctl` assumes the router is already
   running and health-checks it; it does not start, stop, or manage the
   router process. On Windows, the canonical way to run the router is the
   Desktop App installer (Start-menu/desktop shortcut — the router

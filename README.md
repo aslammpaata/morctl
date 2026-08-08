@@ -1,4 +1,4 @@
-# morpheus-doctor
+# morctl
 
 A single-binary CLI for the Morpheus proxy-router. Turns the manual
 "open session → copy session ID → run inference" chain into one command,
@@ -20,7 +20,7 @@ curl -X POST http://localhost:8082/v1/chat/completions \
   -d '{"model":"...", "messages":[...]}'
 ```
 
-`morpheus-doctor --dev` does both steps in one command, with the session ID
+`morctl --dev` does both steps in one command, with the session ID
 captured in memory — no copy-pasting.
 
 ## Build
@@ -28,13 +28,13 @@ captured in memory — no copy-pasting.
 Requires Go 1.21+.
 
 ```bash
-go build -o morpheus-doctor .
+go build -o morctl .
 ```
 
 Cross-compile for Windows from Linux/WSL/macOS:
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -o morpheus-doctor.exe .
+GOOS=windows GOARCH=amd64 go build -o morctl.exe .
 ```
 
 ## Prerequisites
@@ -48,26 +48,26 @@ GOOS=windows GOARCH=amd64 go build -o morpheus-doctor.exe .
 
 **Preflight** — checks the router is up and shows your wallet balance:
 ```bash
-./morpheus-doctor
+./morctl
 ```
 
 **Developer flow** — opens a session and runs one inference call:
 ```bash
-./morpheus-doctor --dev --prompt "Hello!"
+./morctl --dev --prompt "Hello!"
 ```
 
 **Interactive** — keeps a session open across multiple prompts, with full
 conversation history resent each turn (the router does not retain context
 on its own — see [Notes](#notes)):
 ```bash
-./morpheus-doctor --dev --interactive
+./morctl --dev --interactive
 ```
 Type `exit` or `quit` to end. The session's stake refunds automatically at
 its natural expiry — exiting the loop does not close it early.
 
 **Force a new session**, ignoring any cached one:
 ```bash
-./morpheus-doctor --dev --fresh
+./morctl --dev --fresh
 ```
 
 ### Flags
@@ -87,14 +87,14 @@ its natural expiry — exiting the loop does not close it early.
 
 ## Session caching
 
-`morpheus-doctor --dev` writes the opened session's ID and expiry to
-`.morpheus-doctor-session.json` next to the binary. Subsequent runs against
+`morctl --dev` writes the opened session's ID and expiry to
+`.morctl-session.json` next to the binary. Subsequent runs against
 the same model reuse that session (if it still has enough time left) instead
 of opening — and staking for — a new one. Use `--fresh` to bypass this.
 
 ## Credentials
 
-The router's API password lives in its `.cookie` file. `morpheus-doctor`
+The router's API password lives in its `.cookie` file. `morctl`
 reads it from, in order:
 1. `MORPHEUS_ROUTER_AUTH` environment variable (`user:pass`)
 2. The path given by `--cookie`, or `COOKIE_FILE_PATH` if set, or `./.cookie`
@@ -105,7 +105,7 @@ commit it, don't paste it into chat tools or logs.
 
 ## Router setup
 
-`morpheus-doctor` doesn't manage the router's lifecycle — it just talks to
+`morctl` doesn't manage the router's lifecycle — it just talks to
 whichever router is already running.
 
 - **Desktop App**: launch it normally; the router auto-starts and its
