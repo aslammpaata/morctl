@@ -1,9 +1,11 @@
 # morctl
 
-A single-binary CLI for the Morpheus proxy-router. Turns the manual
-"open session → copy session ID → run inference" chain into one command,
-with a preflight check (router reachable, wallet balance) and a multi-turn
-interactive chat mode.
+*(Renamed from `morpheus-doctor` — see [REBRAND-AND-ROADMAP.md](./REBRAND-AND-ROADMAP.md).
+Old repo URL redirects here automatically.)*
+
+A single-binary CLI for the Morpheus proxy-router. Turns the manual "open session → copy
+session ID → run inference" chain into one command, with a preflight check (router
+reachable, wallet balance) and a multi-turn interactive chat mode.
 
 ## Why
 
@@ -20,22 +22,40 @@ curl -X POST http://localhost:8082/v1/chat/completions \
   -d '{"model":"...", "messages":[...]}'
 ```
 
-`morctl --dev` does both steps in one command, with the session ID
-captured in memory — no copy-pasting.
+`morctl --dev` does both steps in one command, with the session ID captured in memory —
+no copy-pasting.
 
 ## Build
 
 Requires Go 1.21+.
 
+**Linux/macOS (native):**
 ```bash
 go build -o morctl .
 ```
 
-Cross-compile for Windows from Linux/WSL/macOS:
+**Windows (native):**
+```powershell
+go build -o morctl.exe .
+```
 
+**Cross-compile for Windows from Linux/WSL/macOS:**
 ```bash
 GOOS=windows GOARCH=amd64 go build -o morctl.exe .
 ```
+
+**Cross-compile for macOS from Linux/Windows/WSL:**
+```bash
+# Intel (x86_64)
+GOOS=darwin GOARCH=amd64 go build -o morctl .
+
+# Apple Silicon (M1/M2/M3/M4)
+GOOS=darwin GOARCH=arm64 go build -o morctl .
+```
+
+> macOS users: the resulting binary is unsigned. On first run, Gatekeeper may block it —
+> right-click the binary → **Open** → **Open anyway**, or run
+> `xattr -d com.apple.quarantine ./morctl` to clear the quarantine flag from the terminal.
 
 ## Prerequisites
 
@@ -56,14 +76,14 @@ GOOS=windows GOARCH=amd64 go build -o morctl.exe .
 ./morctl --dev --prompt "Hello!"
 ```
 
-**Interactive** — keeps a session open across multiple prompts, with full
-conversation history resent each turn (the router does not retain context
-on its own — see [Notes](#notes)):
+**Interactive** — keeps a session open across multiple prompts, with full conversation
+history resent each turn (the router does not retain context on its own — see
+[Notes](#notes)):
 ```bash
 ./morctl --dev --interactive
 ```
-Type `exit` or `quit` to end. The session's stake refunds automatically at
-its natural expiry — exiting the loop does not close it early.
+Type `exit` or `quit` to end. The session's stake refunds automatically at its natural
+expiry — exiting the loop does not close it early.
 
 **Force a new session**, ignoring any cached one:
 ```bash
@@ -87,54 +107,64 @@ its natural expiry — exiting the loop does not close it early.
 
 ## Session caching
 
-`morctl --dev` writes the opened session's ID and expiry to
-`.morctl-session.json` next to the binary. Subsequent runs against
-the same model reuse that session (if it still has enough time left) instead
-of opening — and staking for — a new one. Use `--fresh` to bypass this.
+`morctl --dev` writes the opened session's ID and expiry to `.morctl-session.json` next to
+the binary. Subsequent runs against the same model reuse that session (if it still has
+enough time left) instead of opening — and staking for — a new one. Use `--fresh` to
+bypass this.
 
 ## Credentials
 
-The router's API password lives in its `.cookie` file. `morctl`
-reads it from, in order:
+The router's API password lives in its `.cookie` file. `morctl` reads it from, in order:
 1. `MORPHEUS_ROUTER_AUTH` environment variable (`user:pass`)
 2. The path given by `--cookie`, or `COOKIE_FILE_PATH` if set, or `./.cookie`
 
-Credentials are **never** accepted via a command-line flag (they'd leak into
-shell history / process lists). Treat the `.cookie` file as a secret — don't
-commit it, don't paste it into chat tools or logs.
+Credentials are **never** accepted via a command-line flag (they'd leak into shell
+history / process lists). Treat the `.cookie` file as a secret — don't commit it, don't
+paste it into chat tools or logs.
 
 ## Router setup
 
-`morctl` doesn't manage the router's lifecycle — it just talks to
-whichever router is already running.
+`morctl` doesn't manage the router's lifecycle — it just talks to whichever router is
+already running.
 
-- **Desktop App**: launch it normally; the router auto-starts and its
-  `.cookie` lives at `%APPDATA%\morpheus-app\services\.cookie` (Windows) or
-  the equivalent app-data path on macOS/Linux.
+- **Desktop App**: launch it normally; the router auto-starts. The `.cookie` lives at
+  `%APPDATA%\morpheus-app\services\.cookie` (Windows) or the equivalent app-data path on
+  macOS/Linux.
 - **Headless**: run `proxy-router` directly with a `.env` configuring
   `ETH_NODE_ADDRESS`, chain ID, contract addresses, etc. Provide a wallet via
   `WALLET_PRIVATE_KEY` or the `POST /wallet/privateKey` endpoint at startup.
 
 ## Notes
 
-- **Conversation context is not automatic.** The router does not retain
-  chat history between requests, even within one session — `--interactive`
-  handles this client-side by resending the full message history every
-  turn. A raw `/v1/chat/completions` call with only the latest message will
-  not have any memory of earlier turns.
-- **Session close vs. session end.** Typing `exit` in `--interactive` stops
-  the local loop only; it does not close the session on-chain. Your stake
-  returns automatically ~1 minute after the session's natural expiry, same
-  as any Morpheus session. This avoids the early-close on-hold penalty.
+- **Conversation context is not automatic.** The router does not retain chat history
+  between requests, even within one session — `--interactive` handles this client-side
+  by resending the full message history every turn. A raw `/v1/chat/completions` call
+  with only the latest message will not have any memory of earlier turns. (This is
+  confirmed intended behavior, not a bug — the client is responsible for turn/history
+  management.)
+- **Session close vs. session end.** Typing `exit` in `--interactive` stops the local
+  loop only; it does not close the session on-chain. Your stake returns automatically
+  ~1 minute after the session's natural expiry, same as any Morpheus session. This
+  avoids the early-close on-hold penalty.
 
 ## Known limitations / status
 
-- Tested against router v7.3.0 on Windows, against multiple models, with
-  session reuse, balance reporting, and graceful handling of router-down /
-  invalid-model-ID / mid-session provider-disconnect failure cases.
-- No scoped-user support yet (currently uses whatever credentials you give
-  it, typically the router's admin cookie). For shared/multi-user setups,
-  create a scoped `open_session`+`chat` user via the router's `/auth/users`
-  endpoint and pass those credentials instead.
-- Health-check is router-level only (`/healthcheck`); it does not check
-  individual model/provider health.
+- Tested against router v7.3.0 on Windows, against multiple models, with session reuse,
+  balance reporting, and graceful handling of router-down / invalid-model-ID /
+  mid-session provider-disconnect failure cases.
+- macOS/Linux native builds compile cleanly but have not yet had the same depth of
+  live testing as the Windows build — treat as expected-to-work, not yet as
+  thoroughly verified.
+- No scoped-user support yet (currently uses whatever credentials you give it,
+  typically the router's admin cookie). For shared/multi-user setups, create a scoped
+  `open_session`+`chat` user via the router's `/auth/users` endpoint and pass those
+  credentials instead.
+- Health-check is router-level only (`/healthcheck`); it does not check individual
+  model/provider health.
+
+## Roadmap
+
+A separate, future tool (`morpheus-doctor` v2) is planned to actually earn that name —
+install, diagnose, and repair Morpheus installations. See
+[REBRAND-AND-ROADMAP.md](./REBRAND-AND-ROADMAP.md) for the full scope. Not a current
+priority; `morctl` remains focused on session/inference operations.
