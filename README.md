@@ -1,6 +1,6 @@
 # morctl
 
-*(Renamed from `morpheus-doctor` — see [REBRAND-AND-ROADMAP.md](./REBRAND-AND-ROADMAP.md).
+*(Renamed from `morpheus-doctor` — see [REBRAND-AND-ROADMAP.md](./Rebrand%20and%20roadmap.md).
 Old repo URL redirects here automatically.)*
 
 A single-binary CLI for the Morpheus proxy-router. Turns the manual "open session → copy
