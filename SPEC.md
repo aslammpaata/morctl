@@ -35,6 +35,10 @@ turn — see [Context handling](#context-handling).
 $ morctl --dev --model kimi-k2.5 --prompt "Hello!"
 ✔ router reachable
   wallet: 18.9442 MOR, 0.0021 ETH
+
+  model: kimi-k2.5
+     id: 0xbb9e920d...
+    via: --model "kimi-k2.5" resolved to an id
 > opening session (model kimi-k2.5, 600s)...
 ✔ session opened: 0x4c8e4022...
 > running inference...
@@ -77,6 +81,29 @@ gap this addresses.
 - Headless wallet: `WALLET_PRIVATE_KEY` on the router side (falls back to
   system keychain when unset) — `morctl` doesn't touch the wallet
   directly, it only talks to whatever router process is already running.
+
+## No default model
+
+`--dev`/`--interactive` require `--model-id` (exact) or `--model` (a
+marketplace name, resolved to an id). There is deliberately no default.
+
+Earlier versions defaulted to `kimi-k2.5` with a matching hardcoded
+model id. That was wrong for one blunt reason: **opening a session
+stakes MOR.** A user who forgot the flag staked against a model they
+never named, and because the name and the id were two separate flags
+with two separate defaults, passing only one of them could silently
+desync the pair.
+
+Name resolution exists because an on-chain id is not something anyone
+remembers, but it is deliberately strict: names are *not* unique (58 of
+517 live names were duplicated on mainnet when this was written), so an
+ambiguous name is an error listing the candidate ids, never a silent
+first match. Deleted models are filtered out. The model list is fetched
+only when a name actually needs resolving — it is a ~30s call against
+a 517-entry marketplace — and cached for the process.
+
+Whichever path is taken, the run states the name, the id and where the
+choice came from before it opens anything.
 
 ## Design decisions
 

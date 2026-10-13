@@ -261,6 +261,246 @@ func TestLoadAuth(t *testing.T) {
 	})
 }
 
+// modelsRoute serves a small stand-in marketplace, including a deliberately
+// duplicated name and a deleted entry.
+func modelsRoute() http.HandlerFunc {
+	return jsonRoute(`{"models":[
+		{"Id":"0x1111111111111111111111111111111111111111111111111111111111111111","Name":"kimi-k2.5","ModelType":"LLM","IsDeleted":false},
+		{"Id":"0x2222222222222222222222222222222222222222222222222222222222222222","Name":"glm-5.3-flash","ModelType":"LLM","IsDeleted":false},
+		{"Id":"0x3333333333333333333333333333333333333333333333333333333333333333","Name":"deepseek-v4-flash","ModelType":"LLM","IsDeleted":false},
+		{"Id":"0x4444444444444444444444444444444444444444444444444444444444444444","Name":"deepseek-v4-flash","ModelType":"LLM","IsDeleted":false},
+		{"Id":"0x5555555555555555555555555555555555555555555555555555555555555555","Name":"retired-model","ModelType":"LLM","IsDeleted":true}
+	]}`)
+}
+
+func TestLooksLikeModelID(t *testing.T) {
+	valid := "0x" + strings.Repeat("a", 64)
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{valid, true},
+		{"0x" + strings.Repeat("A", 64), true},
+		{"0x2b5b7c295de206820e042221b83a25324d57fd2c757a92594c465c4b1976b7e4", true},
+		{"", false},
+		{"kimi-k2.5", false},
+		{strings.Repeat("a", 66), false},        // no 0x prefix
+		{"0x" + strings.Repeat("a", 63), false}, // too short
+		{"0x" + strings.Repeat("a", 65), false}, // too long
+		{"0x" + strings.Repeat("g", 64), false}, // not hex
+		{"0X" + strings.Repeat("a", 64), false}, // wrong prefix case
+	}
+	for _, tc := range cases {
+		if got := looksLikeModelID(tc.in); got != tc.want {
+			t.Errorf("looksLikeModelID(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestResolveModelRequiresExplicitChoice is the core of the no-silent-default
+// change: with no model flags at all, nothing is opened and nothing is staked.
+func TestResolveModelRequiresExplicitChoice(t *testing.T) {
+	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+		"GET /blockchain/models": func(w http.ResponseWriter, r *http.Request) {
+			t.Error("resolveModel must not hit the marketplace when no model was named")
+		},
+	})
+	_, _, _, err := resolveModel(c, config{})
+	if err == nil {
+		t.Fatal("want an error when neither --model nor --model-id is given")
+	}
+	for _, want := range []string{"--model-id", "--model", "--list-models", "stakes MOR"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got:\n%v", want, err)
+		}
+	}
+}
+
+func TestResolveModelFromModelID(t *testing.T) {
+	id := "0x1111111111111111111111111111111111111111111111111111111111111111"
+
+	t.Run("name is looked up for the label", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": modelsRoute(),
+		})
+		model, modelID, why, err := resolveModel(c, config{modelID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if modelID != id {
+			t.Errorf("modelID = %q, want %q", modelID, id)
+		}
+		if model != "kimi-k2.5" {
+			t.Errorf("model label = %q, want kimi-k2.5", model)
+		}
+		if why == "" {
+			t.Error("resolveModel must explain where the choice came from")
+		}
+	})
+
+	t.Run("an unlistable marketplace does not fail the run", func(t *testing.T) {
+		// The label is cosmetic, so a lookup failure must not block inference.
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": statusRoute(http.StatusInternalServerError, `{"error":"rpc down"}`),
+		})
+		model, modelID, _, err := resolveModel(c, config{modelID: id})
+		if err != nil {
+			t.Fatalf("a failed name lookup must not fail resolution: %v", err)
+		}
+		if modelID != id || model != id {
+			t.Errorf("want the id used as its own label, got model=%q id=%q", model, modelID)
+		}
+	})
+
+	t.Run("explicit label is taken without a lookup", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": func(w http.ResponseWriter, r *http.Request) {
+				t.Error("no marketplace call is needed when both flags are given")
+			},
+		})
+		model, modelID, _, err := resolveModel(c, config{model: "my-label", modelID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if model != "my-label" || modelID != id {
+			t.Errorf("got model=%q id=%q", model, modelID)
+		}
+	})
+
+	t.Run("a malformed id is rejected before any request", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{})
+		_, _, _, err := resolveModel(c, config{modelID: "0xnope"})
+		if err == nil {
+			t.Fatal("want an error for a malformed --model-id")
+		}
+		if !strings.Contains(err.Error(), "--model-id") {
+			t.Errorf("error should name the flag, got: %v", err)
+		}
+	})
+}
+
+func TestResolveModelFromName(t *testing.T) {
+	t.Run("unique name resolves to its id", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": modelsRoute(),
+		})
+		model, modelID, why, err := resolveModel(c, config{model: "glm-5.3-flash"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "0x2222222222222222222222222222222222222222222222222222222222222222"
+		if modelID != want {
+			t.Errorf("modelID = %q, want %q", modelID, want)
+		}
+		if model != "glm-5.3-flash" {
+			t.Errorf("model = %q", model)
+		}
+		if !strings.Contains(why, "resolved") {
+			t.Errorf("why = %q, want it to mention resolution", why)
+		}
+	})
+
+	t.Run("name matching is case-insensitive", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": modelsRoute(),
+		})
+		_, modelID, _, err := resolveModel(c, config{model: "GLM-5.3-Flash"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if modelID != "0x2222222222222222222222222222222222222222222222222222222222222222" {
+			t.Errorf("modelID = %q", modelID)
+		}
+	})
+
+	t.Run("a duplicated name is an error, not a silent first match", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": modelsRoute(),
+		})
+		_, _, _, err := resolveModel(c, config{model: "deepseek-v4-flash"})
+		if err == nil {
+			t.Fatal("want an error for an ambiguous model name")
+		}
+		// Both candidate ids must be offered so the user can choose.
+		for _, id := range []string{"0x3333", "0x4444"} {
+			if !strings.Contains(err.Error(), id) {
+				t.Errorf("error should list candidate %s, got:\n%v", id, err)
+			}
+		}
+		if !strings.Contains(err.Error(), "--model-id") {
+			t.Errorf("error should point at --model-id, got: %v", err)
+		}
+	})
+
+	t.Run("deleted models are not resolvable", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": modelsRoute(),
+		})
+		if _, _, _, err := resolveModel(c, config{model: "retired-model"}); err == nil {
+			t.Fatal("a deleted model must not resolve")
+		}
+	})
+
+	t.Run("an unknown name suggests close matches", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/models": modelsRoute(),
+		})
+		_, _, _, err := resolveModel(c, config{model: "kimi"})
+		if err == nil {
+			t.Fatal("want an error for a name that is not an exact match")
+		}
+		if !strings.Contains(err.Error(), "kimi-k2.5") {
+			t.Errorf("error should suggest the near match, got: %v", err)
+		}
+	})
+}
+
+func TestModelsFiltersDeletedAndCaches(t *testing.T) {
+	calls := 0
+	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+		"GET /blockchain/models": func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			modelsRoute()(w, r)
+		},
+	})
+	ms, err := c.models()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ms) != 4 {
+		t.Errorf("got %d live models, want 4 (the deleted one must be dropped)", len(ms))
+	}
+	for _, m := range ms {
+		if m.IsDeleted {
+			t.Errorf("deleted model %q leaked through", m.Name)
+		}
+	}
+	if _, err := c.models(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Errorf("models() made %d HTTP calls, want 1 (the list must be cached)", calls)
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"short", 10, "short"},
+		{"exactly-10", 10, "exactly-10"},
+		{"this-name-is-far-too-long", 10, "this-na..."},
+		{"abcd", 3, "abc"},
+	}
+	for _, tc := range cases {
+		if got := truncate(tc.in, tc.n); got != tc.want {
+			t.Errorf("truncate(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+}
+
 func TestClientBalance(t *testing.T) {
 	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
 		"GET /blockchain/balance": jsonRoute(`{"eth":"399745950320894","mor":"5000000000000000000"}`),

@@ -71,23 +71,34 @@ GOOS=darwin GOARCH=arm64 go build -o morctl .
 ./morctl
 ```
 
-**Developer flow** — opens a session and runs one inference call:
+**List models** — see what's on the marketplace (narrow with `--model`):
 ```bash
-./morctl --dev --prompt "Hello!"
+./morctl --list-models
+./morctl --list-models --model kimi
+```
+
+**Developer flow** — opens a session and runs one inference call. A model is
+required; `morctl` will not pick one for you, because opening a session stakes MOR:
+```bash
+./morctl --dev --model-id 0xbb9e920d... --prompt "Hello!"
+
+# or by name, which is resolved to an id (names are not unique, so an
+# ambiguous name is refused with the candidate ids listed):
+./morctl --dev --model kimi-k2.5 --prompt "Hello!"
 ```
 
 **Interactive** — keeps a session open across multiple prompts, with full conversation
 history resent each turn (the router does not retain context on its own — see
 [Notes](#notes)):
 ```bash
-./morctl --dev --interactive
+./morctl --dev --interactive --model-id 0xbb9e920d...
 ```
 Type `exit` or `quit` to end. The session's stake refunds automatically at its natural
 expiry — exiting the loop does not close it early.
 
 **Force a new session**, ignoring any cached one:
 ```bash
-./morctl --dev --fresh
+./morctl --dev --fresh --model-id 0xbb9e920d...
 ```
 
 ### Flags
@@ -95,8 +106,9 @@ expiry — exiting the loop does not close it early.
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `localhost:8082` | Router API host:port |
-| `--model` | `kimi-k2.5` | Model name for the completion request |
-| `--model-id` | *(kimi-k2.5's ID)* | On-chain model ID (`0x...`) |
+| `--model-id` | *(none — required)* | On-chain model ID (`0x` + 64 hex). Exact; preferred |
+| `--model` | *(none)* | Marketplace model name, resolved to an ID. Also narrows `--list-models` |
+| `--list-models` | off | List live marketplace models and exit |
 | `--prompt` | `"Hello!"` | Prompt to send in `--dev` mode |
 | `--duration` | `600` | Session duration in seconds |
 | `--dev` | off | Open a session and run inference |
@@ -104,6 +116,20 @@ expiry — exiting the loop does not close it early.
 | `--fresh` | off | Ignore any cached session, open a new one |
 | `--json` | off | Also print raw request/response JSON |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
+
+### No default model
+
+`--dev`, `--interactive` and `--prompt` require a model: pass `--model-id` (exact) or
+`--model` (a name, resolved against the marketplace). There is deliberately **no**
+default, because opening a session stakes MOR — a silent default meant staking against
+a model the user never named.
+
+Earlier versions defaulted to `kimi-k2.5`. **If you have scripts, aliases or guide steps
+that relied on that, add `--model-id 0xbb9e920d94ad3fa2861e1e209d0a969dbe9e1af1cf1ad95c49f76d7b63d32d93`
+explicitly.** Model names are not unique on the marketplace (58 of 517 live names were
+duplicated when this was written), so `--model <name>` refuses an ambiguous name and
+prints the candidate IDs instead of guessing. Whichever way the model is chosen, the run
+prints the name, the ID and where the choice came from before opening anything.
 
 ## Session caching
 

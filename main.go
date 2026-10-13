@@ -24,8 +24,6 @@ import (
 
 const (
 	defaultHost       = "localhost:8082"
-	defaultModel      = "kimi-k2.5"
-	defaultModelID    = "0xbb9e920d94ad3fa2861e1e209d0a969dbe9e1af1cf1ad95c49f76d7b63d32d93"
 	defaultPrompt     = "Hello!"
 	defaultDuration   = 600 // seconds (10 minutes)
 	defaultCookie     = "./.cookie"
@@ -46,6 +44,7 @@ type config struct {
 	timeout     time.Duration
 	interactive bool
 	fresh       bool
+	listModels  bool
 }
 
 func main() {
@@ -59,8 +58,8 @@ func main() {
 func parseFlags() config {
 	var cfg config
 	flag.StringVar(&cfg.host, "host", defaultHost, "proxy-router API host:port")
-	flag.StringVar(&cfg.model, "model", defaultModel, "model name for the completion request")
-	flag.StringVar(&cfg.modelID, "model-id", defaultModelID, "on-chain model id (0x...)")
+	flag.StringVar(&cfg.model, "model", "", "marketplace model name (resolved to an id; names are not unique)")
+	flag.StringVar(&cfg.modelID, "model-id", "", "on-chain model id (0x..., exact -- preferred over --model)")
 	flag.StringVar(&cfg.prompt, "prompt", defaultPrompt, "prompt to send in --dev mode")
 	flag.IntVar(&cfg.duration, "duration", defaultDuration, "session duration in seconds")
 	flag.BoolVar(&cfg.dev, "dev", false, "developer flow: open a session and run inference")
@@ -68,6 +67,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.cookie, "cookie", cookieDefault(), "path to the router .cookie file")
 	flag.BoolVar(&cfg.interactive, "interactive", false, "keep the session open for multiple prompts (type 'exit' to end)")
 	flag.BoolVar(&cfg.fresh, "fresh", false, "ignore any cached session and open a new one")
+	flag.BoolVar(&cfg.listModels, "list-models", false, "list marketplace models and exit (narrow with --model)")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
 	return cfg
@@ -114,6 +114,8 @@ type client struct {
 	user string
 	pass string
 	json bool
+
+	modelCache []modelEntry // populated lazily by models()
 }
 
 func newClient(cfg config) (*client, error) {
@@ -229,6 +231,194 @@ func formatWei(wei string) string {
 	return f.Text('f', 4)
 }
 
+// modelEntry is one marketplace model from GET /blockchain/models. Only the
+// fields morctl needs are decoded. Note IsDeleted: this field was DeletedAt in
+// older routers, which is why mor-cli's deleted-model filter matches nothing
+// against a current router.
+type modelEntry struct {
+	ID        string `json:"Id"`
+	Name      string `json:"Name"`
+	ModelType string `json:"ModelType"`
+	IsDeleted bool   `json:"IsDeleted"`
+}
+
+// models fetches the marketplace model list, drops deleted entries and caches
+// the result for the process. The list is large (517 live models on mainnet
+// when this was written) and the call takes tens of seconds, so it is only
+// fetched when a name actually has to be resolved.
+func (c *client) models() ([]modelEntry, error) {
+	if c.modelCache != nil {
+		return c.modelCache, nil
+	}
+	var resp struct {
+		Models []modelEntry `json:"models"`
+	}
+	if err := c.do(http.MethodGet, "/blockchain/models", nil, nil, &resp); err != nil {
+		return nil, err
+	}
+	live := make([]modelEntry, 0, len(resp.Models))
+	for _, m := range resp.Models {
+		if !m.IsDeleted {
+			live = append(live, m)
+		}
+	}
+	c.modelCache = live
+	return live, nil
+}
+
+// looksLikeModelID reports whether s has the shape of an on-chain model id:
+// 0x followed by 64 hex digits. Catching a typo here is cheaper than letting
+// the router reject it once the session request is already in flight.
+func looksLikeModelID(s string) bool {
+	if len(s) != 66 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	for _, r := range s[2:] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// errNoModel is returned when neither --model nor --model-id was given. morctl
+// deliberately has no default model: opening a session stakes MOR, so the
+// choice has to be the user's (see SPEC.md, "No default model").
+var errNoModel = errors.New("no model selected -- morctl will not pick one for you, because opening a session stakes MOR.\n" +
+	"  Pass one of:\n" +
+	"    --model-id 0x<64 hex>   on-chain model id (exact, preferred)\n" +
+	"    --model <name>          marketplace name, resolved to an id (names are not unique)\n" +
+	"  To see what is available:  morctl --list-models")
+
+// resolveModel determines which model the session will run against and returns
+// a short note on where that choice came from, so the run can say so out loud
+// instead of quietly picking something the user did not ask for.
+func resolveModel(c *client, cfg config) (model, modelID, why string, err error) {
+	switch {
+	case cfg.modelID != "":
+		if !looksLikeModelID(cfg.modelID) {
+			return "", "", "", fmt.Errorf("--model-id %q is not an 0x-prefixed 32-byte id", cfg.modelID)
+		}
+		if cfg.model != "" {
+			// Both given: --model is only the label on the completion request,
+			// so it is taken at face value rather than costing a lookup.
+			return cfg.model, cfg.modelID, "--model-id, labelled with --model", nil
+		}
+		// Label the request with the real name when that is cheap to learn,
+		// but never fail the run over what is a cosmetic field.
+		if name, lookupErr := c.modelNameFor(cfg.modelID); lookupErr == nil && name != "" {
+			return name, cfg.modelID, "--model-id, name looked up on the marketplace", nil
+		}
+		return cfg.modelID, cfg.modelID, "--model-id", nil
+
+	case cfg.model != "":
+		id, err := c.findModelID(cfg.model)
+		if err != nil {
+			return "", "", "", err
+		}
+		return cfg.model, id, fmt.Sprintf("--model %q resolved to an id", cfg.model), nil
+
+	default:
+		return "", "", "", errNoModel
+	}
+}
+
+// modelNameFor returns the marketplace name for a model id, or "" if unknown.
+func (c *client) modelNameFor(id string) (string, error) {
+	ms, err := c.models()
+	if err != nil {
+		return "", err
+	}
+	for _, m := range ms {
+		if strings.EqualFold(m.ID, id) {
+			return m.Name, nil
+		}
+	}
+	return "", nil
+}
+
+// findModelID resolves a marketplace model name to its on-chain id. Names are
+// not unique -- 58 of 517 live names were duplicated on mainnet when this was
+// written -- so an ambiguous name is an error, never a silent first match.
+func (c *client) findModelID(name string) (string, error) {
+	if c.modelCache == nil {
+		fmt.Printf("> resolving model %q against the marketplace (this can take ~30s)...\n", name)
+	}
+	ms, err := c.models()
+	if err != nil {
+		return "", fmt.Errorf("could not list models to resolve --model %q: %w", name, err)
+	}
+	var matches []modelEntry
+	for _, m := range ms {
+		if strings.EqualFold(m.Name, name) {
+			matches = append(matches, m)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0].ID, nil
+	case 0:
+		var near []string
+		lower := strings.ToLower(name)
+		for _, m := range ms {
+			if strings.Contains(strings.ToLower(m.Name), lower) {
+				near = append(near, m.Name)
+			}
+			if len(near) == 5 {
+				break
+			}
+		}
+		if len(near) > 0 {
+			return "", fmt.Errorf("no model is named exactly %q; close matches: %s", name, strings.Join(near, ", "))
+		}
+		return "", fmt.Errorf("no model named %q on the marketplace (try: morctl --list-models)", name)
+	default:
+		ids := make([]string, 0, len(matches))
+		for _, m := range matches {
+			ids = append(ids, m.ID)
+		}
+		return "", fmt.Errorf("%d live models are named %q -- pick one with --model-id:\n    %s",
+			len(matches), name, strings.Join(ids, "\n    "))
+	}
+}
+
+// listModels prints the live marketplace models, narrowed by --model if given.
+func listModels(c *client, cfg config) error {
+	ms, err := c.models()
+	if err != nil {
+		return err
+	}
+	filter := strings.ToLower(cfg.model)
+	shown := 0
+	for _, m := range ms {
+		if filter != "" && !strings.Contains(strings.ToLower(m.Name), filter) {
+			continue
+		}
+		kind := m.ModelType
+		if kind == "" || kind == "UNKNOWN" {
+			kind = "-"
+		}
+		fmt.Printf("  %-44s  %s  %s\n", truncate(m.Name, 44), m.ID, kind)
+		shown++
+	}
+	if shown == 0 {
+		fmt.Printf("  no live model name contains %q (%d models listed)\n", cfg.model, len(ms))
+		return nil
+	}
+	fmt.Printf("\n  %d model(s). Use the id with --model-id.\n", shown)
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 3 {
+		return s[:n]
+	}
+	return s[:n-3] + "..."
+}
+
 func run(cfg config) error {
 	c, err := newClient(cfg)
 	if err != nil {
@@ -256,8 +446,13 @@ func run(cfg config) error {
 		}
 	}
 
+	if cfg.listModels {
+		fmt.Println()
+		return listModels(c, cfg)
+	}
+
 	if !cfg.dev {
-		fmt.Println("\nPreflight OK. Re-run with --dev to open a session and run inference.")
+		fmt.Println("\nPreflight OK. Re-run with --dev --model-id 0x... to open a session and run inference.")
 		return nil
 	}
 	return devFlow(c, cfg)
@@ -328,6 +523,16 @@ func saveSessionCache(s sessionCache) {
 // hands off to the interactive loop -- replacing the manual open-session /
 // copy-id / run-inference chain (AUDIT F3/F4).
 func devFlow(c *client, cfg config) error {
+	// Resolve the model before anything else: this is the step that used to
+	// fall back to a hardcoded default, quietly staking MOR against a model
+	// the user never named.
+	model, modelID, why, err := resolveModel(c, cfg)
+	if err != nil {
+		return err
+	}
+	cfg.model, cfg.modelID = model, modelID
+	fmt.Printf("\n  model: %s\n     id: %s\n    via: %s\n", model, modelID, why)
+
 	var sessionID string
 	var exp time.Time
 
