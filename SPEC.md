@@ -8,7 +8,7 @@ manual.
 
 Manually testing inference against a Morpheus proxy-router meant three
 separate `curl` calls with a session ID hand-copied between them (see
-[`AUDIT.md`](../morpheus-internship/contributions/AUDIT.md), findings F3/F4).
+`AUDIT.md` in the internship contributions repo, findings F3/F4).
 `morctl` collapses that into one command.
 
 ## Why Go
@@ -29,7 +29,24 @@ then runs one inference call and prints the reply.
 
 **`--dev --interactive`**: same session-open behavior, then loops on stdin,
 maintaining the full message history client-side and resending it every
-turn — see [Context handling](#context-handling).
+turn — see [Context handling](#context-handling) and
+[Interactive mode](#interactive-mode).
+
+**`--diagnose`**: checks router, components, credentials, chain id, RPC
+reachability, balance, allowance, stake on hold and per-model health,
+each with a suggested fix — see [Diagnose](#diagnose).
+
+**`--sessions`**: lists this wallet's recent sessions with model, status,
+escrowed stake and time remaining — see
+[Session visibility](#session-visibility).
+
+**`--stakes` / `--claim-stakes --confirm`**: shows MOR parked on hold by
+an early session close, and claims it once released — see
+[Stake on hold, and claiming it](#stake-on-hold-and-claiming-it).
+
+**`--list-models`**: lists live marketplace models, narrowable with
+`--model`. Exists mainly so the "no model selected" error can point at
+this tool rather than another one.
 
 ```
 $ morctl --dev --model kimi-k2.5 --prompt "Hello!"
@@ -309,19 +326,79 @@ throttling (the router ships with seven shared public Base endpoints by
 default), dead RPC endpoints, insufficient stake, models with no bids,
 provider disconnects, and cookies rotated by a router restart.
 
+## Scope, and why it is this shape
+
+`morctl` owns the **session lifecycle and its failure modes**: open a
+session, run inference, see what is open, find stuck stake, and diagnose
+why none of it is working. `mor-cli` remains the official CLI for
+**marketplace operations** — registering providers, models and bids,
+allowances, interactive model browsing, local-model chat.
+
+That split is a deliberate choice, not an accident of effort. Reviewing
+`mor-cli` at upstream v7.14.0 turned up one fact that settled it: every
+file under `cli/` is byte-identical between 7.5.0 and v7.14.0 — nine
+minor releases with no source changes, while the router API moved on
+underneath it. Upstream closes *issues* quickly (six of seven filed by
+this project within nine days), but `mor-cli` itself is unowned, and its
+deepest problems are architectural rather than patchable. So the gaps
+worth closing for our own users are closed here, and the small
+self-contained fixes go upstream as separate PRs.
+
+What that rules out: competing on chat UX against a bubbletea TUI,
+duplicating provider/model/bid registration, and wrapping wallet
+creation. Those stay `mor-cli`'s.
+
 ## Non-goals
 
 - Not an installer for the Desktop App.
-- Not a general-purpose replacement for `mor-cli` or the router's HTTP
-  API — a thin, honest wrapper around the one specific painful workflow
-  (session → inference), not a full admin CLI.
+- Not a replacement for `mor-cli`'s marketplace commands — see
+  [Scope](#scope-and-why-it-is-this-shape).
 - Not an independent prober of model/provider health: `--diagnose` relays
   the provider self-reports the router already publishes, it does not
   test providers itself.
 
+## Testing
+
+The suite runs against an `httptest` mock router, never a real one. That is
+a hard rule rather than a convenience: this tool opens sessions that stake
+MOR, and a test suite that could do that by accident is a test suite nobody
+will run.
+
+The consequence is that some behaviour cannot be covered there — a real
+session open, reuse of a real session, conversation restored across
+processes against a live model, and an actual stake withdrawal. Those live
+in `scripts/live-test.sh`, which is deliberately *not* part of `make check`:
+
+- Read-only checks run by default and spend nothing.
+- Each money-spending phase needs its own flag (`--spend`, `--claim`,
+  `--make-onhold`) *and* a typed confirmation.
+- The wallet's MOR is read before and after, so the net spend is reported
+  rather than guessed.
+
+`--make-onhold` deserves its own note. Stake only goes on hold after an
+*early* close, and morctl never closes a session early — so the claim path
+is unreachable in normal operation. Making it testable means deliberately
+accepting the contract's 24h lock, which is a cost no script should impose
+without being asked. It also uses `mor-cli` for the close, because morctl
+has no close command and should not grow one just to test a path.
+
 ## Next candidates (not yet built)
 
-- `--local` beginner preflight track covering wallet/network sanity beyond
-  router reachability (see original scaffold notes).
 - Scoped-user creation helper, so shared/booth setups don't need the admin
   cookie.
+- A real machine-readable output mode. `--json` is currently a debug echo
+  of each request and response interleaved with human text, which is not
+  something a script can parse; the honest fix is a separate flag that
+  emits one JSON document and nothing else.
+- Repair actions behind explicit confirmation, starting with
+  `POST /config/ethNode` to replace a dead or rate-limited RPC —
+  `--diagnose` already identifies that case but only advises.
+- Concurrency for the marketplace fetch. One ~30s call is tolerable for a
+  name lookup; it would not be if more commands came to depend on it.
+
+Upstream (`mor-cli`) rather than here: a `--duration` flag for the chat
+TUI's hardcoded 3600s, the missing response-status check in its streaming
+path, bounded-concurrency bid loading, lazy API-client construction so
+`--help` works with the router down, a `listBlockchainSession` label that
+prints the model id as "provider", and a deleted-model filter that no
+longer matches anything (`DeletedAt` → `IsDeleted`).

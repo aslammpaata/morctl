@@ -22,12 +22,36 @@ curl -X POST http://localhost:8082/v1/chat/completions \
   -d '{"model":"...", "messages":[...]}'
 ```
 
-`morctl --dev` does both steps in one command, with the session ID captured in memory —
-no copy-pasting.
+`morctl --dev` does both steps in one command, with the session ID captured and cached —
+no copy-pasting, and the next run reuses the same session instead of staking for a new one.
+
+## morctl or mor-cli?
+
+**`mor-cli` is the official CLI** and ships as a prebuilt binary with every node
+release. Use it for **marketplace operations**: registering providers, models and bids,
+reading and approving allowances, browsing models interactively, chatting with a local
+model.
+
+**`morctl` is an operator tool for the session lifecycle and its failure modes.** Use it
+to open a session and run inference in one scriptable command, to see what sessions are
+open and what MOR they hold, to find and claim stake stuck on hold, and to diagnose why
+a session won't open.
+
+`morctl` deliberately does **not** duplicate provider/model/bid registration, wallet
+creation or local-model chat. If you need those, reach for `mor-cli`.
 
 ## Build
 
-Requires Go 1.21+.
+Requires Go 1.21+. No dependencies — the whole tool is standard library, so a plain
+`go build` needs no network access.
+
+```bash
+make build        # native binary
+make check        # go vet + go test
+make build-all    # all four supported targets into ./dist
+```
+
+Without `make`:
 
 **Linux/macOS (native):**
 ```bash
@@ -281,6 +305,36 @@ The **original error is never hidden**: `--verbose` or `--json` prints the raw r
 alongside the translation, and an error with no matching rule is printed verbatim rather
 than given an invented cause.
 
+## Testing
+
+```bash
+make check     # go vet + go test -- no router needed, nothing spent
+```
+
+The unit suite runs entirely against an `httptest` mock router, so **no test can open a
+session or spend MOR**.
+
+The paths that genuinely need a real session — opening one, reusing it, restoring its
+conversation across runs, and claiming stake back — live in a separate script:
+
+```bash
+./scripts/live-test.sh                 # read-only checks only; spends nothing
+./scripts/live-test.sh --spend         # + opens ONE session (stakes MOR)
+./scripts/live-test.sh --claim         # + withdraws claimable stake (sends a tx)
+./scripts/live-test.sh --make-onhold   # closes a session early to create
+                                       #   claimable stake -- 24h lock, opt-in
+```
+
+Nothing that costs money runs without the matching flag, **and** each phase prints what
+it is about to do and waits for you to type `yes` (`--yes` skips the prompts for an
+unattended run). The script records the wallet's MOR before and after, so the net spend
+is reported at the end, and writes a full transcript to `live-test-<stamp>.log`.
+
+> `--make-onhold` exists because stake only goes on hold after an **early** close, and
+> `morctl` never closes a session early. To exercise `--claim-stakes` for real you have
+> to deliberately accept the contract's 24-hour lock on the refund. It uses `mor-cli` to
+> do the close, since `morctl` has no close command and shouldn't grow one.
+
 ## Credentials
 
 The router's API password lives in its `.cookie` file. `morctl` reads it from, in order:
@@ -319,9 +373,13 @@ already running.
 
 ## Known limitations / status
 
-- Tested against router v7.3.0 on Windows, against multiple models, with session reuse,
-  balance reporting, and graceful handling of router-down / invalid-model-ID /
+- Tested against router **v7.14.0** on Windows, against multiple models, with session
+  reuse, history restore across runs, balance and stake reporting, and graceful handling
+  of router-down / stale-cookie / invalid-model-ID / rate-limited-RPC /
   mid-session provider-disconnect failure cases.
+- `--claim-stakes` has been exercised against a mock router, **not** against a real
+  wallet with claimable stake. The guard paths (nothing claimable, missing `--confirm`)
+  are verified live.
 - macOS/Linux native builds compile cleanly but have not yet had the same depth of
   live testing as the Windows build — treat as expected-to-work, not yet as
   thoroughly verified.
@@ -335,7 +393,17 @@ already running.
 
 ## Roadmap
 
-A separate, future tool (`morpheus-doctor` v2) is planned to actually earn that name —
-install, diagnose, and repair Morpheus installations. See
-[REBRAND-AND-ROADMAP.md](./REBRAND-AND-ROADMAP.md) for the full scope. Not a current
-priority; `morctl` remains focused on session/inference operations.
+`morctl` has taken on the **diagnosis** half of what was planned as a separate
+`morpheus-doctor` v2 — `--diagnose` covers router, credentials, chain, RPC, funds and
+model health. What remains in that separate-tool plan is the part `morctl` deliberately
+won't do: **installing** Morpheus components and **repairing** broken installations
+(clearing corrupt local state, regenerating a stale cookie, resetting config). See
+[Rebrand & Roadmap](./Rebrand%20and%20roadmap.md) for that scope.
+
+Next candidates here, in rough order:
+
+- Scoped-user creation helper, so shared/booth setups don't need the admin cookie.
+- A real machine-readable `--json` output mode (today `--json` is a debug echo, not a
+  parseable document).
+- Repair actions behind explicit confirmation, starting with `POST /config/ethNode` to
+  replace a dead or rate-limited RPC — `--diagnose` already identifies that case.
