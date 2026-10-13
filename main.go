@@ -50,6 +50,9 @@ type config struct {
 	verbose      bool
 	sessions     bool
 	resolveNames bool
+	stakes       bool
+	claimStakes  bool
+	confirm      bool
 	cacheFile    string
 }
 
@@ -78,6 +81,9 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.verbose, "verbose", false, "show the raw router response alongside translated errors")
 	flag.BoolVar(&cfg.sessions, "sessions", false, "list this wallet's recent sessions and exit")
 	flag.BoolVar(&cfg.resolveNames, "resolve-names", false, "resolve model ids to names in --sessions (adds a ~30s marketplace fetch)")
+	flag.BoolVar(&cfg.stakes, "stakes", false, "show MOR stake on hold for this wallet and exit")
+	flag.BoolVar(&cfg.claimStakes, "claim-stakes", false, "withdraw releasable stake (requires --confirm; sends a transaction)")
+	flag.BoolVar(&cfg.confirm, "confirm", false, "confirm an action that sends a transaction")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
 	cfg.cacheFile = sessionCacheFile
@@ -734,6 +740,129 @@ func showSessions(c *client, cfg config) error {
 	return nil
 }
 
+// stakesOnHold is GET /blockchain/stakes/onhold. Both figures are wei strings.
+//
+// Available is stake whose 24h lock has elapsed and can be withdrawn now;
+// Hold is stake still inside that window. The lock exists because closing a
+// session early pushes the refund into userStakesOnHold with a releaseAt of
+// closedAt + 1 day (SessionRouter.sol) -- which is exactly why morctl lets
+// sessions expire naturally rather than closing them.
+type stakesOnHold struct {
+	Available string `json:"available"`
+	Hold      string `json:"hold"`
+}
+
+// any reports whether there is any stake worth mentioning.
+func (s stakesOnHold) any() bool {
+	return s.Available != "" && s.Available != "0" || s.Hold != "" && s.Hold != "0"
+}
+
+func (s stakesOnHold) claimable() bool {
+	return s.Available != "" && s.Available != "0"
+}
+
+// stakes reads the consumer stake held in the Diamond for the router's wallet.
+// This needs no private key and no direct RPC: the router exposes it (node
+// v7.11.0 and later, upstream issue #827). A 404 means an older router.
+func (c *client) stakes() (stakesOnHold, error) {
+	var s stakesOnHold
+	err := c.do(http.MethodGet, "/blockchain/stakes/onhold?iterations=255", nil, nil, &s)
+	return s, err
+}
+
+// withdrawStakes claims releasable stake. The router's own wallet signs the
+// transaction -- morctl never reads, stores or transmits a private key.
+func (c *client) withdrawStakes() (string, error) {
+	var res struct {
+		Tx string `json:"tx"`
+	}
+	err := c.do(http.MethodPost, "/blockchain/stakes/withdraw", nil,
+		map[string]any{"iterations": 255}, &res)
+	if err != nil {
+		return "", err
+	}
+	return res.Tx, nil
+}
+
+// showStakes reports stake on hold for this wallet.
+func showStakes(c *client, cfg config) error {
+	s, err := c.stakes()
+	if err != nil {
+		return fmt.Errorf("read stakes on hold: %w", err)
+	}
+	fmt.Println()
+	fmt.Printf("  claimable now: %s MOR\n", formatWei(s.Available))
+	fmt.Printf("  still locked:  %s MOR\n", formatWei(s.Hold))
+	switch {
+	case s.claimable():
+		fmt.Println("\n  Claim it with:  morctl --claim-stakes --confirm")
+	case s.Hold != "" && s.Hold != "0":
+		fmt.Println("\n  Locked stake is released 24h after the session that produced it closed early.")
+	default:
+		fmt.Println("\n  Nothing on hold. Sessions left to expire naturally refund without a 24h lock.")
+	}
+	return nil
+}
+
+// claimStakes withdraws releasable stake. This is the one morctl command that
+// sends a state-changing, gas-spending transaction, so it is gated twice: an
+// explicit --confirm flag, and -- on a terminal -- a typed confirmation. It
+// refuses outright when there is nothing to claim, rather than burning gas on
+// a transaction the contract would revert.
+func claimStakes(c *client, cfg config) error {
+	s, err := c.stakes()
+	if err != nil {
+		return fmt.Errorf("read stakes on hold before claiming: %w", err)
+	}
+	fmt.Println()
+	fmt.Printf("  claimable now: %s MOR\n", formatWei(s.Available))
+	fmt.Printf("  still locked:  %s MOR\n", formatWei(s.Hold))
+
+	if !s.claimable() {
+		fmt.Println()
+		if s.Hold != "" && s.Hold != "0" {
+			return errors.New("nothing to claim yet: the stake on hold is still inside its 24h lock")
+		}
+		return errors.New("nothing to claim: this wallet has no stake on hold")
+	}
+
+	if !cfg.confirm {
+		fmt.Println()
+		return fmt.Errorf("refusing to send a transaction without confirmation: re-run with --claim-stakes --confirm to claim %s MOR", formatWei(s.Available))
+	}
+
+	// On a terminal, make the person say it out loud. Piped input (CI, scripts)
+	// is taken as already deliberate, since --confirm had to be passed.
+	if isTerminal(os.Stdin) {
+		fmt.Printf("\n  This sends a transaction from the router's wallet and costs gas.\n")
+		fmt.Printf("  Type 'claim' to withdraw %s MOR: ", formatWei(s.Available))
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() || strings.TrimSpace(scanner.Text()) != "claim" {
+			return errors.New("cancelled -- nothing was sent")
+		}
+	}
+
+	fmt.Println("\n> withdrawing stake...")
+	tx, err := c.withdrawStakes()
+	if err != nil {
+		return fmt.Errorf("withdraw stake: %w", err)
+	}
+	fmt.Printf("✔ withdrawal submitted\n  tx: %s\n", tx)
+	fmt.Println("  The balance updates once the transaction confirms on Base.")
+	return nil
+}
+
+// isTerminal reports whether f is an interactive terminal, so prompts are only
+// shown where someone can answer them. Uses the file mode rather than a
+// dependency on a tty package.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
 func run(cfg config) error {
 	c, err := newClient(cfg)
 	if err != nil {
@@ -775,6 +904,20 @@ func run(cfg config) error {
 		}
 	}
 
+	// Surface stake sitting on hold during preflight: it is MOR the user owns
+	// but cannot see anywhere else, and claiming it is often what unblocks a
+	// wallet that looks short of funds. Silently skipped on routers that
+	// predate the endpoint, and never fatal.
+	if balanceOK {
+		if s, err := c.stakes(); err == nil && s.any() {
+			fmt.Printf("  stake on hold: %s MOR claimable, %s MOR locked\n",
+				formatWei(s.Available), formatWei(s.Hold))
+			if s.claimable() {
+				fmt.Println("  → claim it with: morctl --claim-stakes --confirm")
+			}
+		}
+	}
+
 	if cfg.listModels {
 		fmt.Println()
 		return listModels(c, cfg)
@@ -782,6 +925,14 @@ func run(cfg config) error {
 
 	if cfg.sessions {
 		return showSessions(c, cfg)
+	}
+
+	if cfg.claimStakes {
+		return claimStakes(c, cfg)
+	}
+
+	if cfg.stakes {
+		return showStakes(c, cfg)
 	}
 
 	if !cfg.dev {

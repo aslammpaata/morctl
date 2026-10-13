@@ -144,6 +144,39 @@ choice came from before it opens anything.
   (opening a session that then fails on insufficient MOR — observed
   independently via `mor-cli`, see AUDIT F-series).
 
+## Stake on hold, and claiming it
+
+Closing a session early does not refund the stake immediately: the
+contract pushes it into `userStakesOnHold` with
+`releaseAt = closedAt + 1 day` (`SessionRouter.sol`). That is the
+mechanism behind morctl's standing advice to let sessions expire
+naturally rather than closing them — and the reason MOR can appear to
+have vanished.
+
+morctl reads `GET /blockchain/stakes/onhold` and can claim via
+`POST /blockchain/stakes/withdraw`. Both arrived in node **v7.11.0**
+(upstream issue #827); before that, recovery needed `cast` or an
+equivalent, which is what the guides had to document.
+
+Design points:
+
+- **No private key, ever.** The claim is an HTTP call; the router's own
+  wallet signs the transaction. morctl does not read, store or transmit
+  a key, and does not talk to an RPC directly. An earlier sketch of this
+  feature assumed a direct `getUserStakesOnHold` contract call, which
+  would have required a signer for the withdrawal — the router
+  endpoints removed that problem entirely.
+- **Two gates on the one command that spends gas.** `--claim-stakes`
+  requires `--confirm`, and on a terminal also a typed confirmation.
+  Piped stdin is treated as already deliberate, so scripts work.
+- **Refuse rather than revert.** With nothing claimable, morctl sends
+  nothing and says why, instead of burning gas on a transaction the
+  contract would reject. A still-locked balance is reported as such.
+- **Claimable stake is surfaced during preflight**, because it is MOR
+  the user owns that is invisible everywhere else, and claiming it is
+  often what unblocks a wallet that looks short of funds. It is skipped
+  silently on routers without the endpoint.
+
 ## Session visibility
 
 `--sessions` answers the question the session cache cannot: what else is

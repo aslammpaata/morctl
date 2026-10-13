@@ -1190,6 +1190,184 @@ func TestShowSessions(t *testing.T) {
 	})
 }
 
+// --- stake awareness --------------------------------------------------------
+
+func TestStakesOnHoldPredicates(t *testing.T) {
+	cases := []struct {
+		name          string
+		s             stakesOnHold
+		wantAny       bool
+		wantClaimable bool
+	}{
+		{name: "nothing on hold", s: stakesOnHold{Available: "0", Hold: "0"}},
+		{name: "empty response fields", s: stakesOnHold{}},
+		{
+			name:          "claimable now",
+			s:             stakesOnHold{Available: "2500000000000000000", Hold: "0"},
+			wantAny:       true,
+			wantClaimable: true,
+		},
+		{
+			name:    "locked but not yet claimable",
+			s:       stakesOnHold{Available: "0", Hold: "2500000000000000000"},
+			wantAny: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.s.any(); got != tc.wantAny {
+				t.Errorf("any() = %v, want %v", got, tc.wantAny)
+			}
+			if got := tc.s.claimable(); got != tc.wantClaimable {
+				t.Errorf("claimable() = %v, want %v", got, tc.wantClaimable)
+			}
+		})
+	}
+}
+
+func TestStakesRead(t *testing.T) {
+	t.Run("reads both figures", func(t *testing.T) {
+		var gotQuery string
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/stakes/onhold": func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+				_, _ = w.Write([]byte(`{"available":"2500000000000000000","hold":"1000000000000000000"}`))
+			},
+		})
+		s, err := c.stakes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if formatWei(s.Available) != "2.5000" || formatWei(s.Hold) != "1.0000" {
+			t.Errorf("got available=%s hold=%s", formatWei(s.Available), formatWei(s.Hold))
+		}
+		if !strings.Contains(gotQuery, "iterations=255") {
+			t.Errorf("query = %q, want the contract iteration cap", gotQuery)
+		}
+	})
+
+	t.Run("an older router is explained, not crashed on", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{})
+		_, err := c.stakes() // the mock 404s unknown routes, like a pre-7.11.0 router
+		if err == nil {
+			t.Fatal("want an error from a router without the endpoint")
+		}
+		var re *routerError
+		if !errors.As(err, &re) {
+			t.Fatalf("want a *routerError, got %T", err)
+		}
+		d, ok := re.friendly()
+		if !ok {
+			t.Fatal("a 404 on the stake endpoint should be translated")
+		}
+		if !strings.Contains(d.fix, "v7.11.0") {
+			t.Errorf("fix should name the version that added it, got %q", d.fix)
+		}
+	})
+}
+
+// TestClaimStakesRefusesWithoutConfirm and the cases below cover the gating on
+// the one command that spends gas. No test ever reaches a real router.
+func TestClaimStakes(t *testing.T) {
+	// withdrawCalled is the thing that must not happen unless every gate passes.
+	newRouter := func(t *testing.T, available, hold string, withdrawCalled *bool) *client {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/stakes/onhold": jsonRoute(
+				`{"available":"` + available + `","hold":"` + hold + `"}`),
+			"POST /blockchain/stakes/withdraw": func(w http.ResponseWriter, r *http.Request) {
+				*withdrawCalled = true
+				var body struct {
+					Iterations int `json:"iterations"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				if body.Iterations != 255 {
+					t.Errorf("iterations = %d, want 255", body.Iterations)
+				}
+				_, _ = w.Write([]byte(`{"tx":"0xdeadbeef"}`))
+			},
+		})
+		return c
+	}
+
+	t.Run("refuses without --confirm and sends nothing", func(t *testing.T) {
+		called := false
+		c := newRouter(t, "2500000000000000000", "0", &called)
+		err := claimStakes(c, config{claimStakes: true})
+		if err == nil {
+			t.Fatal("want a refusal without --confirm")
+		}
+		if !strings.Contains(err.Error(), "--confirm") {
+			t.Errorf("the refusal should name the flag, got: %v", err)
+		}
+		if called {
+			t.Error("no transaction may be sent without --confirm")
+		}
+	})
+
+	t.Run("refuses when there is nothing to claim", func(t *testing.T) {
+		called := false
+		c := newRouter(t, "0", "0", &called)
+		// Even with --confirm: burning gas on a revert is not a service.
+		err := claimStakes(c, config{claimStakes: true, confirm: true})
+		if err == nil {
+			t.Fatal("want a refusal when nothing is claimable")
+		}
+		if called {
+			t.Error("no transaction may be sent with nothing to claim")
+		}
+	})
+
+	t.Run("explains a lock that has not elapsed", func(t *testing.T) {
+		called := false
+		c := newRouter(t, "0", "2500000000000000000", &called)
+		err := claimStakes(c, config{claimStakes: true, confirm: true})
+		if err == nil {
+			t.Fatal("want a refusal while the stake is still locked")
+		}
+		if !strings.Contains(err.Error(), "24h") {
+			t.Errorf("the refusal should explain the lock, got: %v", err)
+		}
+		if called {
+			t.Error("no transaction may be sent while the stake is locked")
+		}
+	})
+
+	t.Run("claims with --confirm on non-interactive stdin", func(t *testing.T) {
+		called := false
+		c := newRouter(t, "2500000000000000000", "0", &called)
+		// A file-backed stdin is not a terminal, so --confirm alone proceeds:
+		// this is the scripted path.
+		withStdin(t, "")
+		if err := claimStakes(c, config{claimStakes: true, confirm: true}); err != nil {
+			t.Fatal(err)
+		}
+		if !called {
+			t.Error("the withdrawal should have been sent")
+		}
+	})
+
+	t.Run("a withdrawal already in flight is explained", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /blockchain/stakes/onhold": jsonRoute(`{"available":"2500000000000000000","hold":"0"}`),
+			"POST /blockchain/stakes/withdraw": statusRoute(http.StatusConflict,
+				`{"error":"operation exists or journal unavailable"}`),
+		})
+		withStdin(t, "")
+		err := claimStakes(c, config{claimStakes: true, confirm: true})
+		if err == nil {
+			t.Fatal("want an error on 409")
+		}
+		var re *routerError
+		if !errors.As(err, &re) {
+			t.Fatalf("want a *routerError, got %T", err)
+		}
+		d, ok := re.friendly()
+		if !ok || !strings.Contains(d.cause, "already in flight") {
+			t.Errorf("409 should be translated, got ok=%v %+v", ok, d)
+		}
+	})
+}
+
 // --- friendly error translation --------------------------------------------
 
 func TestRouterErrorFriendly(t *testing.T) {

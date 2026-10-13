@@ -113,6 +113,22 @@ Status is `LIVE` (usable now), `expired` (past its window, stake still returning
 `closed` (settled). The wallet address is read from the router, so you never have to
 supply it — unlike `mor-cli listBlockchainSession`, which requires `--user`.
 
+**Stake on hold** — MOR locked by sessions that closed early, and claiming it back:
+```bash
+./morctl --stakes                      # read-only
+./morctl --claim-stakes --confirm      # sends a transaction
+```
+Closing a session early doesn't refund immediately: the contract parks the refund in
+`userStakesOnHold` with a 24-hour lock (`releaseAt = closedAt + 1 day`). `--stakes` shows
+what is claimable now versus still locked; claimable stake is also flagged during
+preflight, since it's MOR you own that shows up nowhere else.
+
+`--claim-stakes` **requires `--confirm`** and, on a terminal, a typed confirmation. It
+refuses outright when there is nothing claimable rather than spending gas on a transaction
+the contract would revert. **The router's own wallet signs it** — `morctl` never reads,
+stores or transmits a private key. Needs node **v7.11.0+** (upstream issue #827); older
+routers get a clear message saying so.
+
 **Force a new session**, ignoring any cached one:
 ```bash
 ./morctl --dev --fresh --model-id 0xbb9e920d...
@@ -136,6 +152,9 @@ supply it — unlike `mor-cli listBlockchainSession`, which requires `--user`.
 | `--verbose` | off | Show the raw router response alongside translated errors |
 | `--sessions` | off | List this wallet's recent sessions and exit |
 | `--resolve-names` | off | Show model names in `--sessions` (adds a ~30s fetch) |
+| `--stakes` | off | Show MOR stake on hold for this wallet and exit |
+| `--claim-stakes` | off | Withdraw releasable stake (needs `--confirm`; sends a transaction) |
+| `--confirm` | off | Confirm an action that sends a transaction |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
 
 ### No default model
