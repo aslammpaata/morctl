@@ -114,6 +114,7 @@ expiry — exiting the loop does not close it early.
 | `--dev` | off | Open a session and run inference |
 | `--interactive` | off | Multi-turn chat mode (implies `--dev`) |
 | `--fresh` | off | Ignore any cached session, open a new one |
+| `--no-history` | off | Don't store or restore conversation history in the cache |
 | `--json` | off | Also print raw request/response JSON |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
 
@@ -131,12 +132,29 @@ duplicated when this was written), so `--model <name>` refuses an ambiguous name
 prints the candidate IDs instead of guessing. Whichever way the model is chosen, the run
 prints the name, the ID and where the choice came from before opening anything.
 
-## Session caching
+## Session caching and conversation history
 
-`morctl --dev` writes the opened session's ID and expiry to `.morctl-session.json` next to
-the binary. Subsequent runs against the same model reuse that session (if it still has
-enough time left) instead of opening — and staking for — a new one. Use `--fresh` to
+`morctl --dev` writes the opened session's ID, model and expiry to `.morctl-session.json`
+next to the binary. Subsequent runs against the same model reuse that session (if it still
+has enough time left) instead of opening — and staking for — a new one. Use `--fresh` to
 bypass this.
+
+`--interactive` also stores the **conversation history** in that file, saved after every
+completed turn. Resuming a cached session restores the transcript, so the model still has
+the context of what was said in an earlier run — without this, reusing a session
+reconnected you to a model that had forgotten the conversation, since the router keeps no
+conversational state of its own (see [Notes](#notes)).
+
+- A new session always starts with empty history. `--fresh` opens a new session and starts
+  a new conversation.
+- A failed turn is not stored, so a rate-limit error doesn't leave a dangling question in
+  the transcript.
+- One-shot `--prompt` is deliberately stateless: it sends only that prompt, so scripted
+  runs stay reproducible. It leaves any stored history untouched.
+
+> **The cache file contains your conversation text.** It is written `0600` and is
+> gitignored. Pass `--no-history` to keep conversations out of it entirely (the session ID
+> is still cached, so session reuse keeps working).
 
 ## Credentials
 

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -498,6 +501,493 @@ func TestTruncate(t *testing.T) {
 		if got := truncate(tc.in, tc.n); got != tc.want {
 			t.Errorf("truncate(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
 		}
+	}
+}
+
+// --- session cache: history persistence ------------------------------------
+
+func tempCache(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), ".morctl-session.json")
+}
+
+func TestSessionCacheRoundTrip(t *testing.T) {
+	path := tempCache(t)
+	want := sessionCache{
+		SessionID: "0xsess",
+		ModelID:   "0xmodel",
+		Model:     "kimi-k2.5",
+		OpenedAt:  time.Now().Unix(),
+		Duration:  600,
+		ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+		History: []message{
+			{Role: "user", Content: "what is 2+2?"},
+			{Role: "assistant", Content: "4"},
+		},
+	}
+	saveSessionCache(path, want)
+
+	got, ok := loadSessionCache(path)
+	if !ok {
+		t.Fatal("cache did not load back")
+	}
+	if len(got.History) != 2 {
+		t.Fatalf("got %d messages, want 2", len(got.History))
+	}
+	if got.History[0].Role != "user" || got.History[0].Content != "what is 2+2?" {
+		t.Errorf("first message round-tripped wrong: %+v", got.History[0])
+	}
+	if got.History[1].Role != "assistant" || got.History[1].Content != "4" {
+		t.Errorf("second message round-tripped wrong: %+v", got.History[1])
+	}
+	if got.ExpiresAt != want.ExpiresAt {
+		t.Errorf("ExpiresAt = %d, want %d", got.ExpiresAt, want.ExpiresAt)
+	}
+}
+
+func TestSessionCacheIsPrivate(t *testing.T) {
+	// The file holds conversation text, so it must not be world-readable.
+	// (Windows does not model POSIX bits, so this is checked where it applies.)
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	path := tempCache(t)
+	saveSessionCache(path, sessionCache{SessionID: "0xsess"})
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("cache mode = %o, want 600", perm)
+	}
+}
+
+func TestSessionCacheMissingOrCorrupt(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		if _, ok := loadSessionCache(filepath.Join(t.TempDir(), "absent.json")); ok {
+			t.Error("a missing cache must report not-ok, not an empty success")
+		}
+	})
+
+	t.Run("corrupt file is ignored rather than fatal", func(t *testing.T) {
+		path := tempCache(t)
+		if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := loadSessionCache(path); ok {
+			t.Error("a corrupt cache must report not-ok")
+		}
+	})
+}
+
+// TestSessionCacheBackwardCompatible covers cache files written before
+// ExpiresAt and History existed: they must still load and still be reusable.
+func TestSessionCacheBackwardCompatible(t *testing.T) {
+	path := tempCache(t)
+	opened := time.Now().Add(-time.Minute).Unix()
+	old := `{
+	  "sessionID": "0x2b5b7c29",
+	  "modelID": "0xc8530921",
+	  "model": "glm-5.3-flash",
+	  "openedAt": ` + strconv.FormatInt(opened, 10) + `,
+	  "duration": 600
+	}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := loadSessionCache(path)
+	if !ok {
+		t.Fatal("an older cache file must still load")
+	}
+	if got.History != nil {
+		t.Errorf("history should be empty, got %+v", got.History)
+	}
+	if got.ExpiresAt != 0 {
+		t.Errorf("ExpiresAt should be absent, got %d", got.ExpiresAt)
+	}
+	// Expiry must fall back to openedAt + duration.
+	wantExp := time.Unix(opened, 0).Add(600 * time.Second)
+	if !got.expiresAt().Equal(wantExp) {
+		t.Errorf("expiresAt() = %v, want %v", got.expiresAt(), wantExp)
+	}
+	if !got.valid("0xc8530921") {
+		t.Error("an older cache with time left must still be reusable")
+	}
+}
+
+// TestSessionCacheExpiresAtWins guards the reason ExpiresAt is stored at all:
+// a different --duration on a later run must not move an open session's expiry.
+func TestSessionCacheExpiresAtWins(t *testing.T) {
+	realExp := time.Now().Add(5 * time.Minute)
+	s := sessionCache{
+		SessionID: "0xsess",
+		ModelID:   "0xmodel",
+		OpenedAt:  time.Now().Unix(),
+		Duration:  99999, // a later run passed a much larger --duration
+		ExpiresAt: realExp.Unix(),
+	}
+	if got := s.expiresAt(); got.Unix() != realExp.Unix() {
+		t.Errorf("expiresAt() = %v, want the stored %v", got, realExp)
+	}
+}
+
+// TestDevFlowHistoryLifecycle is the end-to-end check for item 1: a new
+// session starts empty, a reused session restores context, and --fresh
+// discards it.
+func TestDevFlowHistoryLifecycle(t *testing.T) {
+	const modelID = "0x1111111111111111111111111111111111111111111111111111111111111111"
+
+	// sentMessages records what each inference call carried.
+	var sent [][]message
+	routes := func() map[string]http.HandlerFunc {
+		return map[string]http.HandlerFunc{
+			"GET /healthcheck":                                jsonRoute(`{"status":"healthy"}`),
+			"GET /blockchain/balance":                         jsonRoute(`{"eth":"1000000000000000000","mor":"50000000000000000000"}`),
+			"GET /blockchain/models":                          modelsRoute(),
+			"POST /blockchain/models/" + modelID + "/session": jsonRoute(`{"sessionID":"0xnewsession"}`),
+			"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Messages []message `json:"messages"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				sent = append(sent, body.Messages)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+			},
+		}
+	}
+
+	t.Run("a new session starts with empty history", func(t *testing.T) {
+		sent = nil
+		path := tempCache(t)
+		// Seed a cache for a *different* model, which must not be inherited.
+		saveSessionCache(path, sessionCache{
+			SessionID: "0xold",
+			ModelID:   "0xsomeothermodel",
+			OpenedAt:  time.Now().Unix(),
+			Duration:  600,
+			ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+			History:   []message{{Role: "user", Content: "leaked from another model"}},
+		})
+		c, srv := newMockRouter(t, routes())
+		cfg := config{modelID: modelID, prompt: "hello", duration: 600, dev: true, cacheFile: path, host: srv.URL}
+		if err := devFlow(c, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent) != 1 {
+			t.Fatalf("got %d inference calls, want 1", len(sent))
+		}
+		if len(sent[0]) != 1 || sent[0][0].Content != "hello" {
+			t.Errorf("a new session must send only the new prompt, got %+v", sent[0])
+		}
+		cached, _ := loadSessionCache(path)
+		if cached.SessionID != "0xnewsession" {
+			t.Errorf("cache should hold the new session, got %q", cached.SessionID)
+		}
+		if len(cached.History) != 0 {
+			t.Errorf("a new session must start with empty history, got %+v", cached.History)
+		}
+	})
+
+	t.Run("a reused session restores its history", func(t *testing.T) {
+		sent = nil
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: "0xlive",
+			ModelID:   modelID,
+			Model:     "kimi-k2.5",
+			OpenedAt:  time.Now().Unix(),
+			Duration:  600,
+			ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+			History: []message{
+				{Role: "user", Content: "my name is Sam"},
+				{Role: "assistant", Content: "nice to meet you"},
+			},
+		})
+		c, srv := newMockRouter(t, routes())
+		// --interactive is the mode that replays history; the one-shot path is
+		// deliberately stateless, so this asserts the cache was read back.
+		cfg := config{modelID: modelID, prompt: "who am I?", duration: 600, dev: true, cacheFile: path, host: srv.URL}
+		if err := devFlow(c, cfg); err != nil {
+			t.Fatal(err)
+		}
+		cached, _ := loadSessionCache(path)
+		if cached.SessionID != "0xlive" {
+			t.Errorf("the live session should have been reused, got %q", cached.SessionID)
+		}
+		if len(cached.History) != 2 {
+			t.Errorf("reuse must not discard stored history, got %+v", cached.History)
+		}
+	})
+
+	t.Run("--fresh opens a new session and drops history", func(t *testing.T) {
+		sent = nil
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: "0xlive",
+			ModelID:   modelID,
+			OpenedAt:  time.Now().Unix(),
+			Duration:  600,
+			ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+			History:   []message{{Role: "user", Content: "forget me"}},
+		})
+		c, srv := newMockRouter(t, routes())
+		cfg := config{modelID: modelID, prompt: "hi", duration: 600, dev: true, fresh: true, cacheFile: path, host: srv.URL}
+		if err := devFlow(c, cfg); err != nil {
+			t.Fatal(err)
+		}
+		cached, _ := loadSessionCache(path)
+		if cached.SessionID != "0xnewsession" {
+			t.Errorf("--fresh must open a new session, got %q", cached.SessionID)
+		}
+		if len(cached.History) != 0 {
+			t.Errorf("--fresh must start with empty history, got %+v", cached.History)
+		}
+		if len(sent[0]) != 1 {
+			t.Errorf("--fresh must not replay old turns, got %+v", sent[0])
+		}
+	})
+
+	t.Run("--no-history does not restore stored context", func(t *testing.T) {
+		sent = nil
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: "0xlive",
+			ModelID:   modelID,
+			OpenedAt:  time.Now().Unix(),
+			Duration:  600,
+			ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+			History:   []message{{Role: "user", Content: "private"}},
+		})
+		c, srv := newMockRouter(t, routes())
+		cfg := config{modelID: modelID, prompt: "hi", duration: 600, dev: true, noHistory: true, cacheFile: path, host: srv.URL}
+		if err := devFlow(c, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent[0]) != 1 || sent[0][0].Content != "hi" {
+			t.Errorf("--no-history must send only the new prompt, got %+v", sent[0])
+		}
+	})
+}
+
+// withStdin points os.Stdin at the given script for the duration of a test,
+// so the interactive loop can be driven without a terminal.
+func withStdin(t *testing.T, script string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stdin")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() {
+		os.Stdin = orig
+		_ = f.Close()
+	})
+}
+
+// TestInteractiveLoopPersistsHistory is the core of item 1: every completed
+// turn is written through to the cache, so an interrupted run loses at most
+// the turn in flight.
+func TestInteractiveLoopPersistsHistory(t *testing.T) {
+	const sessionID = "0xlive"
+	exp := time.Now().Add(10 * time.Minute)
+
+	newCfg := func(path string) config {
+		return config{
+			model:     "kimi-k2.5",
+			modelID:   "0xmodel",
+			duration:  600,
+			cacheFile: path,
+		}
+	}
+
+	t.Run("each turn is saved as it completes", func(t *testing.T) {
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: sessionID, ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: exp.Unix(),
+		})
+		turn := 0
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+				turn++
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"reply ` +
+					strconv.Itoa(turn) + `"}}]}`))
+			},
+		})
+		withStdin(t, "first question\nsecond question\nexit\n")
+		if err := interactiveLoop(c, newCfg(path), sessionID, exp, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		cached, ok := loadSessionCache(path)
+		if !ok {
+			t.Fatal("cache missing after the loop")
+		}
+		want := []message{
+			{Role: "user", Content: "first question"},
+			{Role: "assistant", Content: "reply 1"},
+			{Role: "user", Content: "second question"},
+			{Role: "assistant", Content: "reply 2"},
+		}
+		if len(cached.History) != len(want) {
+			t.Fatalf("got %d messages, want %d: %+v", len(cached.History), len(want), cached.History)
+		}
+		for i := range want {
+			if cached.History[i] != want[i] {
+				t.Errorf("message %d = %+v, want %+v", i, cached.History[i], want[i])
+			}
+		}
+		// The session record itself must survive the history writes.
+		if cached.SessionID != sessionID || cached.ExpiresAt != exp.Unix() {
+			t.Errorf("session record was clobbered: %+v", cached)
+		}
+	})
+
+	t.Run("restored history is carried into the next turn", func(t *testing.T) {
+		path := tempCache(t)
+		prior := []message{
+			{Role: "user", Content: "my name is Sam"},
+			{Role: "assistant", Content: "hello Sam"},
+		}
+		saveSessionCache(path, sessionCache{
+			SessionID: sessionID, ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: exp.Unix(), History: prior,
+		})
+		var sent []message
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Messages []message `json:"messages"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				sent = body.Messages
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"you are Sam"}}]}`))
+			},
+		})
+		withStdin(t, "who am I?\nexit\n")
+		if err := interactiveLoop(c, newCfg(path), sessionID, exp, prior); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent) != 3 {
+			t.Fatalf("the turn should resend 2 prior messages plus the new one, got %d: %+v", len(sent), sent)
+		}
+		if sent[0].Content != "my name is Sam" || sent[2].Content != "who am I?" {
+			t.Errorf("wrong transcript replayed: %+v", sent)
+		}
+		cached, _ := loadSessionCache(path)
+		if len(cached.History) != 4 {
+			t.Errorf("history should have grown to 4, got %d", len(cached.History))
+		}
+	})
+
+	t.Run("a failed turn is not persisted", func(t *testing.T) {
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: sessionID, ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: exp.Unix(),
+		})
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": statusRoute(http.StatusTooManyRequests, `{"error":"over rate limit"}`),
+		})
+		withStdin(t, "this will fail\nexit\n")
+		if err := interactiveLoop(c, newCfg(path), sessionID, exp, nil); err != nil {
+			t.Fatal(err)
+		}
+		cached, _ := loadSessionCache(path)
+		if len(cached.History) != 0 {
+			t.Errorf("a failed turn must not be stored, got %+v", cached.History)
+		}
+	})
+
+	t.Run("--no-history writes nothing back", func(t *testing.T) {
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: sessionID, ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: exp.Unix(),
+		})
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": jsonRoute(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`),
+		})
+		cfg := newCfg(path)
+		cfg.noHistory = true
+		withStdin(t, "something private\nexit\n")
+		if err := interactiveLoop(c, cfg, sessionID, exp, nil); err != nil {
+			t.Fatal(err)
+		}
+		cached, _ := loadSessionCache(path)
+		if len(cached.History) != 0 {
+			t.Errorf("--no-history must not write conversation text, got %+v", cached.History)
+		}
+	})
+
+	t.Run("blank lines are skipped and quit ends the loop", func(t *testing.T) {
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: sessionID, ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: exp.Unix(),
+		})
+		calls := 0
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+			},
+		})
+		withStdin(t, "\n   \nreal question\nquit\nnever read\n")
+		if err := interactiveLoop(c, newCfg(path), sessionID, exp, nil); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 {
+			t.Errorf("got %d inference calls, want 1 (blanks skipped, quit honoured)", calls)
+		}
+	})
+}
+
+// TestChatSendsSessionHeaders checks the wire contract the router relies on.
+func TestChatSendsSessionHeaders(t *testing.T) {
+	var gotSession, gotModelID string
+	var gotBody struct {
+		Model    string    `json:"model"`
+		Messages []message `json:"messages"`
+		Stream   bool      `json:"stream"`
+	}
+	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+		"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+			gotSession = r.Header.Get("session_id")
+			gotModelID = r.Header.Get("model_id")
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":" hi there "}}]}`))
+		},
+	})
+	reply, err := c.chat("0xsess", "kimi-k2.5", "0xmodel", []message{{Role: "user", Content: "hi"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply != "hi there" {
+		t.Errorf("reply = %q, want it trimmed to %q", reply, "hi there")
+	}
+	if gotSession != "0xsess" {
+		t.Errorf("session_id header = %q", gotSession)
+	}
+	if gotModelID != "0xmodel" {
+		t.Errorf("model_id header = %q", gotModelID)
+	}
+	if gotBody.Model != "kimi-k2.5" || gotBody.Stream {
+		t.Errorf("body = %+v, want model kimi-k2.5 and stream false", gotBody)
+	}
+}
+
+func TestChatEmptyChoicesIsAnError(t *testing.T) {
+	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+		"POST /v1/chat/completions": jsonRoute(`{"choices":[]}`),
+	})
+	if _, err := c.chat("0xsess", "m", "0xmodel", []message{{Role: "user", Content: "hi"}}); err == nil {
+		t.Fatal("want an error when the router returns no choices")
 	}
 }
 

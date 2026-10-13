@@ -49,11 +49,16 @@ $ morctl --dev --model kimi-k2.5 --prompt "Hello!"
 
 ## Session caching
 
-`--dev`/`--interactive` write the opened session's ID, model, and expiry to
-`.morctl-session.json` next to the binary. On the next run against
-the same model, if that cached session still has enough time left (30s
-safety margin), it's reused instead of opening — and staking for — a new
-one. `--fresh` bypasses the cache unconditionally.
+`--dev`/`--interactive` write the opened session's ID, model, expiry and
+conversation history to `.morctl-session.json` next to the binary. On the
+next run against the same model, if that cached session still has enough
+time left (30s safety margin), it's reused instead of opening — and
+staking for — a new one. `--fresh` bypasses the cache unconditionally.
+
+`ExpiresAt` is stored directly rather than only derived from
+`openedAt + duration`, so passing a different `--duration` on a later run
+cannot move an already-open session's expiry. Caches written before that
+field existed still load, falling back to the derived value.
 
 This was added after repeated manual testing kept opening redundant sessions
 for what was really the same ongoing test — each one staking MOR that then
@@ -68,6 +73,23 @@ recollection of earlier turns. `--interactive` handles this the standard
 OpenAI-compatible way: the client holds the message history and resends the
 full transcript every turn. See issue #794 upstream for the documentation
 gap this addresses.
+
+Because that transcript lives only in the client, it is persisted with the
+session: `--interactive` writes history to the session cache after every
+completed turn and restores it when a cached session is reused. Without
+that, session reuse handed back a live session attached to a model that
+had forgotten everything said to it — the cache saved MOR but lost the
+conversation. A failed turn is rolled back out of history rather than
+stored, so a rate-limited request leaves no dangling question behind.
+
+Consequences worth being explicit about:
+
+- The cache file holds conversation text. It is written `0600`, it is
+  gitignored, and `--no-history` opts out of storing or restoring it
+  while keeping session reuse working.
+- One-shot `--prompt` stays stateless — it sends only that prompt and
+  leaves stored history untouched — so scripted runs remain
+  reproducible. `--interactive` is the conversational mode.
 
 ## Config & secrets
 

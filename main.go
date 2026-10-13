@@ -45,6 +45,8 @@ type config struct {
 	interactive bool
 	fresh       bool
 	listModels  bool
+	noHistory   bool
+	cacheFile   string
 }
 
 func main() {
@@ -68,8 +70,10 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.interactive, "interactive", false, "keep the session open for multiple prompts (type 'exit' to end)")
 	flag.BoolVar(&cfg.fresh, "fresh", false, "ignore any cached session and open a new one")
 	flag.BoolVar(&cfg.listModels, "list-models", false, "list marketplace models and exit (narrow with --model)")
+	flag.BoolVar(&cfg.noHistory, "no-history", false, "do not store or restore conversation history in the session cache")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
+	cfg.cacheFile = sessionCacheFile
 	return cfg
 }
 
@@ -471,19 +475,41 @@ type chatResp struct {
 	} `json:"choices"`
 }
 
+// message is one turn of an OpenAI-style chat exchange. It is both the wire
+// shape sent to /v1/chat/completions and the on-disk shape in the session
+// cache, so a resumed conversation replays exactly what was sent before.
+type message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 // sessionCache is the on-disk record of the last session morctl opened,
 // stored as a small JSON file next to the binary so --dev/--interactive can reuse
 // a still-live session across separate invocations instead of always opening (and
 // staking for) a new one.
+//
+// It also carries the conversation history, because the router keeps no
+// conversational state (see "Context handling" in SPEC.md): without this,
+// resuming a cached session reconnected to a model that had forgotten
+// everything said to it. The file therefore contains conversation text --
+// it is written 0600, is gitignored, and --no-history opts out entirely.
 type sessionCache struct {
 	SessionID string `json:"sessionID"`
 	ModelID   string `json:"modelID"`
 	Model     string `json:"model"`
 	OpenedAt  int64  `json:"openedAt"` // unix seconds
 	Duration  int    `json:"duration"` // seconds
+	// ExpiresAt is stored directly rather than only derived, so a changed
+	// --duration on a later run cannot move an existing session's expiry.
+	ExpiresAt int64     `json:"expiresAt,omitempty"` // unix seconds
+	History   []message `json:"history,omitempty"`
 }
 
 func (s sessionCache) expiresAt() time.Time {
+	if s.ExpiresAt > 0 {
+		return time.Unix(s.ExpiresAt, 0)
+	}
+	// Fallback for cache files written before ExpiresAt was stored.
 	return time.Unix(s.OpenedAt, 0).Add(time.Duration(s.Duration) * time.Second)
 }
 
@@ -497,9 +523,9 @@ func (s sessionCache) valid(modelID string) bool {
 	return time.Now().Add(sessionSafetyMarg).Before(s.expiresAt())
 }
 
-func loadSessionCache() (sessionCache, bool) {
+func loadSessionCache(path string) (sessionCache, bool) {
 	var s sessionCache
-	b, err := os.ReadFile(sessionCacheFile)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return s, false
 	}
@@ -509,13 +535,14 @@ func loadSessionCache() (sessionCache, bool) {
 	return s, true
 }
 
-// saveSessionCache writes best-effort; a failure to cache shouldn't fail the run.
-func saveSessionCache(s sessionCache) {
+// saveSessionCache writes best-effort; a failure to cache shouldn't fail the
+// run. 0600 because the file holds conversation text as well as a session id.
+func saveSessionCache(path string, s sessionCache) {
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(sessionCacheFile, b, 0o600)
+	_ = os.WriteFile(path, b, 0o600)
 }
 
 // devFlow reuses a cached session if one is valid for this model (unless --fresh),
@@ -535,12 +562,20 @@ func devFlow(c *client, cfg config) error {
 
 	var sessionID string
 	var exp time.Time
+	var history []message
 
 	if !cfg.fresh {
-		if cached, ok := loadSessionCache(); ok && cached.valid(cfg.modelID) {
+		if cached, ok := loadSessionCache(cfg.cacheFile); ok && cached.valid(cfg.modelID) {
 			sessionID = cached.SessionID
 			exp = cached.expiresAt()
 			fmt.Printf("\n✔ reusing cached session: %s (%s remaining)\n", short(sessionID), remaining(exp))
+			// The router holds no conversation state, so resuming the session
+			// without its history would reconnect to a model that had
+			// forgotten the conversation.
+			if !cfg.noHistory && len(cached.History) > 0 {
+				history = cached.History
+				fmt.Printf("  restored %d earlier message(s) of context\n", len(history))
+			}
 		}
 	}
 
@@ -556,24 +591,31 @@ func devFlow(c *client, cfg config) error {
 			return errors.New("open session: response contained no sessionID")
 		}
 		sessionID = sess.SessionID
-		exp = time.Now().Add(time.Duration(cfg.duration) * time.Second)
+		opened := time.Now()
+		exp = opened.Add(time.Duration(cfg.duration) * time.Second)
 		fmt.Printf("✔ session opened: %s\n", sessionID)
-		saveSessionCache(sessionCache{
+		// A new session starts with no history: nothing has been said to it.
+		history = nil
+		saveSessionCache(cfg.cacheFile, sessionCache{
 			SessionID: sessionID,
 			ModelID:   cfg.modelID,
 			Model:     cfg.model,
-			OpenedAt:  time.Now().Unix(),
+			OpenedAt:  opened.Unix(),
 			Duration:  cfg.duration,
+			ExpiresAt: exp.Unix(),
 		})
 	}
 
 	if cfg.interactive {
-		return interactiveLoop(c, cfg, sessionID)
+		return interactiveLoop(c, cfg, sessionID, exp, history)
 	}
 
+	// One-shot --prompt is deliberately stateless: it sends just this prompt
+	// so scripted runs are reproducible, and it leaves any stored history
+	// untouched. --interactive is the conversational mode.
 	fmt.Println("> running inference...")
 	reply, err := c.chat(sessionID, cfg.model, cfg.modelID,
-		[]map[string]string{{"role": "user", "content": cfg.prompt}})
+		[]message{{Role: "user", Content: cfg.prompt}})
 	if err != nil {
 		return fmt.Errorf("inference: %w", err)
 	}
@@ -586,10 +628,33 @@ func devFlow(c *client, cfg config) error {
 // interactiveLoop sends repeated prompts against the same session, maintaining
 // the full message history client-side and resending it each turn (OpenAI-style
 // chat semantics) -- the router does not retain conversation state on its own.
-func interactiveLoop(c *client, cfg config, sessionID string) error {
+func interactiveLoop(c *client, cfg config, sessionID string, exp time.Time, history []message) error {
 	fmt.Printf("\n> session live. Type a message and press Enter (type 'exit' to end early).\n\n")
 	scanner := bufio.NewScanner(os.Stdin)
-	var history []map[string]string
+
+	// persist mirrors the in-memory history to the cache after every turn, so
+	// an interrupted run loses at most the turn in flight.
+	persist := func() {
+		if cfg.noHistory {
+			return
+		}
+		cached, ok := loadSessionCache(cfg.cacheFile)
+		if !ok || cached.SessionID != sessionID {
+			// The cache was replaced or removed underneath us; rebuild the
+			// record rather than writing history against the wrong session.
+			cached = sessionCache{
+				SessionID: sessionID,
+				ModelID:   cfg.modelID,
+				Model:     cfg.model,
+				OpenedAt:  time.Now().Unix(),
+				Duration:  cfg.duration,
+				ExpiresAt: exp.Unix(),
+			}
+		}
+		cached.History = history
+		saveSessionCache(cfg.cacheFile, cached)
+	}
+
 	for {
 		fmt.Print("you> ")
 		if !scanner.Scan() {
@@ -602,14 +667,15 @@ func interactiveLoop(c *client, cfg config, sessionID string) error {
 		if line == "exit" || line == "quit" {
 			break
 		}
-		history = append(history, map[string]string{"role": "user", "content": line})
+		history = append(history, message{Role: "user", Content: line})
 		reply, err := c.chat(sessionID, cfg.model, cfg.modelID, history)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "✖ "+err.Error())
 			history = history[:len(history)-1] // don't poison history with a failed turn
 			continue
 		}
-		history = append(history, map[string]string{"role": "assistant", "content": reply})
+		history = append(history, message{Role: "assistant", Content: reply})
+		persist()
 		fmt.Printf("model> %s\n\n", reply)
 	}
 	fmt.Printf("✅ session %s ended locally (stake refunds automatically at natural expiry; cached for reuse until then)\n", short(sessionID))
@@ -618,7 +684,7 @@ func interactiveLoop(c *client, cfg config, sessionID string) error {
 
 // chat sends the full message history against an already-open session and
 // returns the latest reply text.
-func (c *client) chat(sessionID, model, modelID string, messages []map[string]string) (string, error) {
+func (c *client) chat(sessionID, model, modelID string, messages []message) (string, error) {
 	var chat chatResp
 	err := c.do(http.MethodPost, "/v1/chat/completions",
 		map[string]string{"session_id": sessionID, "model_id": modelID},
