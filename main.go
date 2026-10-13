@@ -1158,8 +1158,14 @@ func runChecks(c *client, cfg config) *report {
 
 		if s, err := c.stakes(); err != nil {
 			var re *routerError
-			if errors.As(walletErr, &re) || errors.As(err, &re) && re.status == 404 {
-				r.warn("stake on hold", "not exposed by this router", "Added in node v7.11.0; upgrade to see and claim it.")
+			switch {
+			case errors.As(err, &re) && re.status == 404:
+				r.warn("stake on hold", "not exposed by this router",
+					"Added in node v7.11.0; upgrade to see and claim it.")
+			default:
+				// Report it either way: silently dropping the check would make
+				// a wallet with stuck stake look clean.
+				r.warn("stake on hold", "could not be read", err.Error())
 			}
 		} else if s.claimable() {
 			r.warn("stake on hold", formatWei(s.Available)+" MOR claimable", "Claim it: morctl --claim-stakes --confirm")

@@ -1404,6 +1404,34 @@ func TestDiagnoseFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("a router without the stake endpoint says so", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		delete(routes, "GET /blockchain/stakes/onhold") // pre-7.11.0 router: 404
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		chk, ok := r.find("stake on hold")
+		if !ok {
+			t.Fatal("the stake check must still appear, not be silently dropped")
+		}
+		if chk.state != "warn" || !strings.Contains(chk.fix, "v7.11.0") {
+			t.Errorf("stake check = %+v, want a warning naming v7.11.0", chk)
+		}
+	})
+
+	t.Run("an unreadable stake endpoint is still reported", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /blockchain/stakes/onhold"] = statusRoute(
+			http.StatusInternalServerError, `{"error":"rpc failure"}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		// Dropping this check would make a wallet with stuck stake look clean.
+		if _, ok := r.find("stake on hold"); !ok {
+			t.Error("a failed stake read must still produce a check line")
+		}
+	})
+
 	t.Run("rate-limited models are reported", func(t *testing.T) {
 		rpc := rpcServer(t, okRPC("0x2105"))
 		routes := healthyRoutes(rpc)
