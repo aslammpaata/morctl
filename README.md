@@ -96,6 +96,23 @@ history resent each turn (the router does not retain context on its own — see
 Type `exit` or `quit` to end. The session's stake refunds automatically at its natural
 expiry — exiting the loop does not close it early.
 
+**Sessions** — list this wallet's recent sessions so overlapping ones are legible:
+```bash
+./morctl --sessions
+./morctl --sessions --resolve-names   # adds a ~30s marketplace fetch for model names
+```
+```
+> sessions for 0xffd9883a2245027b95a4f1801ac6b4e160b373e6
+
+  0x4c8e4022... LIVE    kimi-k2.5                        5.0000 MOR  7m12s left
+  0x2b5b7c29... closed  0xc8530921...                    5.6888 MOR  ended 2026-09-09 15:49
+
+  2 session(s) listed, 1 live, 5.0000 MOR escrowed in them.
+```
+Status is `LIVE` (usable now), `expired` (past its window, stake still returning) or
+`closed` (settled). The wallet address is read from the router, so you never have to
+supply it — unlike `mor-cli listBlockchainSession`, which requires `--user`.
+
 **Force a new session**, ignoring any cached one:
 ```bash
 ./morctl --dev --fresh --model-id 0xbb9e920d...
@@ -117,6 +134,8 @@ expiry — exiting the loop does not close it early.
 | `--no-history` | off | Don't store or restore conversation history in the cache |
 | `--json` | off | Also print raw request/response JSON |
 | `--verbose` | off | Show the raw router response alongside translated errors |
+| `--sessions` | off | List this wallet's recent sessions and exit |
+| `--resolve-names` | off | Show model names in `--sessions` (adds a ~30s fetch) |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
 
 ### No default model

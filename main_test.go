@@ -993,6 +993,203 @@ func TestChatEmptyChoicesIsAnError(t *testing.T) {
 	}
 }
 
+// --- session visibility -----------------------------------------------------
+
+func TestSessionListItemStatus(t *testing.T) {
+	now := time.Now().Unix()
+	cases := []struct {
+		name     string
+		item     sessionListItem
+		want     string
+		wantLive bool
+	}{
+		{
+			name:     "open and in its window",
+			item:     sessionListItem{EndsAt: now + 300},
+			want:     "LIVE",
+			wantLive: true,
+		},
+		{
+			name: "past its end but not settled -- still holds stake",
+			item: sessionListItem{EndsAt: now - 300},
+			want: "expired",
+		},
+		{
+			name: "closed early",
+			item: sessionListItem{EndsAt: now + 300, ClosedAt: now - 10},
+			want: "closed",
+		},
+		{
+			name: "closed and expired reports closed",
+			item: sessionListItem{EndsAt: now - 300, ClosedAt: now - 100},
+			want: "closed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.item.status(); got != tc.want {
+				t.Errorf("status() = %q, want %q", got, tc.want)
+			}
+			if got := tc.item.live(); got != tc.wantLive {
+				t.Errorf("live() = %v, want %v", got, tc.wantLive)
+			}
+		})
+	}
+}
+
+// TestUserSessionsPrecision is the reason Stake is json.Number: the router
+// sends it as a JSON number in wei, and real values exceed what a float64
+// holds exactly. Decoding via float64 would silently corrupt the amount.
+func TestUserSessionsPrecision(t *testing.T) {
+	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+		"GET /blockchain/sessions/user": jsonRoute(`{"sessions":[
+			{"Id":"0xaaa","ModelAgentId":"0xmodel","Stake":5688807051347138757,"PricePerSecond":27777777777777,"OpenedAt":1788939567,"EndsAt":1788940166,"ClosedAt":1788940185},
+			{"Id":"0xbbb","ModelAgentId":"0xmodel","Stake":123456789012345678901234567890,"PricePerSecond":1,"OpenedAt":1,"EndsAt":2,"ClosedAt":0}
+		]}`),
+	})
+	got, err := c.userSessions("0xwallet", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d sessions, want 2", len(got))
+	}
+	// 5688807051347138757 wei, exact to 4dp.
+	if s := formatWei(got[0].Stake.String()); s != "5.6888" {
+		t.Errorf("stake = %q, want 5.6888", s)
+	}
+	if got[0].Stake.String() != "5688807051347138757" {
+		t.Errorf("stake digits were altered: %q", got[0].Stake.String())
+	}
+	// Larger than int64: must survive rather than overflow.
+	if got[1].Stake.String() != "123456789012345678901234567890" {
+		t.Errorf("oversized stake was corrupted: %q", got[1].Stake.String())
+	}
+}
+
+func TestWalletAddress(t *testing.T) {
+	t.Run("reads the router wallet", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet": jsonRoute(`{"address":"0xffd9883a","kind":"mnemonic","derivationPath":"0"}`),
+		})
+		addr, err := c.walletAddress()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if addr != "0xffd9883a" {
+			t.Errorf("address = %q", addr)
+		}
+	})
+
+	t.Run("no wallet is an explained error", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet": jsonRoute(`{}`),
+		})
+		_, err := c.walletAddress()
+		if err == nil {
+			t.Fatal("want an error when the router has no wallet")
+		}
+		if !strings.Contains(err.Error(), "wallet") {
+			t.Errorf("error should mention the wallet, got: %v", err)
+		}
+	})
+}
+
+func TestShowSessions(t *testing.T) {
+	now := time.Now().Unix()
+
+	t.Run("queries by the router's own wallet address", func(t *testing.T) {
+		var gotQuery string
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet": jsonRoute(`{"address":"0xffd9883a"}`),
+			"GET /blockchain/sessions/user": func(w http.ResponseWriter, r *http.Request) {
+				gotQuery = r.URL.RawQuery
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			},
+		})
+		if err := showSessions(c, config{}); err != nil {
+			t.Fatal(err)
+		}
+		// The user never has to supply their own address, unlike mor-cli.
+		if !strings.Contains(gotQuery, "user=0xffd9883a") {
+			t.Errorf("query = %q, want it to carry the wallet address", gotQuery)
+		}
+	})
+
+	t.Run("an empty list is not an error", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet":                   jsonRoute(`{"address":"0xffd9883a"}`),
+			"GET /blockchain/sessions/user": jsonRoute(`{"sessions":[]}`),
+		})
+		if err := showSessions(c, config{}); err != nil {
+			t.Errorf("a wallet with no sessions must not error: %v", err)
+		}
+	})
+
+	t.Run("names are not resolved unless asked", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet": jsonRoute(`{"address":"0xffd9883a"}`),
+			"GET /blockchain/sessions/user": jsonRoute(`{"sessions":[
+				{"Id":"0xaaa","ModelAgentId":"0x1111111111111111111111111111111111111111111111111111111111111111","Stake":1000000000000000000,"EndsAt":` +
+				strconv.FormatInt(now+300, 10) + `}]}`),
+			"GET /blockchain/models": func(w http.ResponseWriter, r *http.Request) {
+				t.Error("the marketplace must not be fetched without --resolve-names")
+			},
+		})
+		if err := showSessions(c, config{}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("--resolve-names fetches the marketplace", func(t *testing.T) {
+		fetched := false
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet": jsonRoute(`{"address":"0xffd9883a"}`),
+			"GET /blockchain/sessions/user": jsonRoute(`{"sessions":[
+				{"Id":"0xaaa","ModelAgentId":"0x1111111111111111111111111111111111111111111111111111111111111111","Stake":1000000000000000000,"EndsAt":` +
+				strconv.FormatInt(now+300, 10) + `}]}`),
+			"GET /blockchain/models": func(w http.ResponseWriter, r *http.Request) {
+				fetched = true
+				modelsRoute()(w, r)
+			},
+		})
+		if err := showSessions(c, config{resolveNames: true}); err != nil {
+			t.Fatal(err)
+		}
+		if !fetched {
+			t.Error("--resolve-names should fetch the marketplace")
+		}
+	})
+
+	t.Run("an unlistable marketplace still lists the sessions", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet": jsonRoute(`{"address":"0xffd9883a"}`),
+			"GET /blockchain/sessions/user": jsonRoute(`{"sessions":[
+				{"Id":"0xaaa","ModelAgentId":"0xmodel","Stake":1000000000000000000,"EndsAt":` +
+				strconv.FormatInt(now+300, 10) + `}]}`),
+			"GET /blockchain/models": statusRoute(http.StatusTooManyRequests, `{"error":"over rate limit"}`),
+		})
+		if err := showSessions(c, config{resolveNames: true}); err != nil {
+			t.Errorf("a name-lookup failure must not lose the session list: %v", err)
+		}
+	})
+
+	t.Run("a failed session query is reported", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"GET /wallet":                   jsonRoute(`{"address":"0xffd9883a"}`),
+			"GET /blockchain/sessions/user": statusRoute(http.StatusTooManyRequests, `{"error":"over rate limit"}`),
+		})
+		err := showSessions(c, config{})
+		if err == nil {
+			t.Fatal("want an error when the session query fails")
+		}
+		var re *routerError
+		if !errors.As(err, &re) {
+			t.Errorf("error should unwrap to *routerError for translation, got %T", err)
+		}
+	})
+}
+
 // --- friendly error translation --------------------------------------------
 
 func TestRouterErrorFriendly(t *testing.T) {

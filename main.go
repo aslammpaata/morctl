@@ -29,25 +29,28 @@ const (
 	defaultCookie     = "./.cookie"
 	sessionCacheFile  = ".morctl-session.json"
 	lowMorWarningMOR  = 5.0 // heads-up threshold, not a hard block
+	sessionListLimit  = 20  // most recent sessions shown by --sessions
 	sessionSafetyMarg = 30 * time.Second
 )
 
 type config struct {
-	host        string
-	model       string
-	modelID     string
-	prompt      string
-	duration    int
-	dev         bool
-	jsonOut     bool
-	cookie      string
-	timeout     time.Duration
-	interactive bool
-	fresh       bool
-	listModels  bool
-	noHistory   bool
-	verbose     bool
-	cacheFile   string
+	host         string
+	model        string
+	modelID      string
+	prompt       string
+	duration     int
+	dev          bool
+	jsonOut      bool
+	cookie       string
+	timeout      time.Duration
+	interactive  bool
+	fresh        bool
+	listModels   bool
+	noHistory    bool
+	verbose      bool
+	sessions     bool
+	resolveNames bool
+	cacheFile    string
 }
 
 func main() {
@@ -73,6 +76,8 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.listModels, "list-models", false, "list marketplace models and exit (narrow with --model)")
 	flag.BoolVar(&cfg.noHistory, "no-history", false, "do not store or restore conversation history in the session cache")
 	flag.BoolVar(&cfg.verbose, "verbose", false, "show the raw router response alongside translated errors")
+	flag.BoolVar(&cfg.sessions, "sessions", false, "list this wallet's recent sessions and exit")
+	flag.BoolVar(&cfg.resolveNames, "resolve-names", false, "resolve model ids to names in --sessions (adds a ~30s marketplace fetch)")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
 	cfg.cacheFile = sessionCacheFile
@@ -602,6 +607,133 @@ func truncate(s string, n int) string {
 	return s[:n-3] + "..."
 }
 
+// sessionListItem is one on-chain session from GET /blockchain/sessions/user.
+// The router marshals its Go struct without json tags, hence the capitalised
+// keys. Stake and PricePerSecond are JSON *numbers* in wei and routinely
+// exceed what a float64 holds exactly, so they are kept as json.Number and
+// formatted through the same big.Int path as every other wei value.
+type sessionListItem struct {
+	ID             string      `json:"Id"`
+	ModelAgentID   string      `json:"ModelAgentId"`
+	Provider       string      `json:"Provider"`
+	Stake          json.Number `json:"Stake"`
+	PricePerSecond json.Number `json:"PricePerSecond"`
+	OpenedAt       int64       `json:"OpenedAt"`
+	EndsAt         int64       `json:"EndsAt"`
+	ClosedAt       int64       `json:"ClosedAt"`
+}
+
+// live reports whether the session is still usable for inference.
+func (s sessionListItem) live() bool {
+	return s.ClosedAt == 0 && s.EndsAt > time.Now().Unix()
+}
+
+// status describes the session in the three states that matter to a user:
+// usable now, finished but still holding stake, or settled.
+func (s sessionListItem) status() string {
+	switch {
+	case s.ClosedAt > 0:
+		return "closed"
+	case s.EndsAt <= time.Now().Unix():
+		return "expired"
+	default:
+		return "LIVE"
+	}
+}
+
+// walletAddress returns the address of the wallet the router is using. It is
+// needed because the session endpoints are queried by user address, and asking
+// the user to supply their own address (as mor-cli does) is a needless step.
+func (c *client) walletAddress() (string, error) {
+	var w struct {
+		Address string `json:"address"`
+	}
+	if err := c.do(http.MethodGet, "/wallet", nil, nil, &w); err != nil {
+		return "", err
+	}
+	if w.Address == "" {
+		return "", errors.New("the router reported no wallet address -- is a wallet set up?")
+	}
+	return w.Address, nil
+}
+
+func (c *client) userSessions(addr string, limit int) ([]sessionListItem, error) {
+	var resp struct {
+		Sessions []sessionListItem `json:"sessions"`
+	}
+	path := fmt.Sprintf("/blockchain/sessions/user?user=%s&limit=%d&order=DESC", addr, limit)
+	if err := c.do(http.MethodGet, path, nil, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Sessions, nil
+}
+
+// showSessions lists this wallet's recent sessions with the three facts that
+// make overlapping sessions legible: which model, how long is left, and how
+// much MOR is escrowed in each.
+func showSessions(c *client, cfg config) error {
+	addr, err := c.walletAddress()
+	if err != nil {
+		return fmt.Errorf("look up wallet: %w", err)
+	}
+	sessions, err := c.userSessions(addr, sessionListLimit)
+	if err != nil {
+		return fmt.Errorf("list sessions: %w", err)
+	}
+	fmt.Printf("\n> sessions for %s\n\n", addr)
+	if len(sessions) == 0 {
+		fmt.Println("  none on record for this wallet.")
+		return nil
+	}
+
+	// Names cost a full marketplace fetch, so they are opt-in.
+	names := map[string]string{}
+	if cfg.resolveNames {
+		fmt.Println("  (resolving model names, this can take ~30s...)")
+		if ms, err := c.models(); err == nil {
+			for _, m := range ms {
+				names[strings.ToLower(m.ID)] = m.Name
+			}
+		} else {
+			fmt.Println("  (model names unavailable; showing ids)")
+		}
+	}
+
+	var liveCount int
+	escrowed := new(big.Int)
+	for _, s := range sessions {
+		model := short(s.ModelAgentID)
+		if n, ok := names[strings.ToLower(s.ModelAgentID)]; ok {
+			model = truncate(n, 28)
+		}
+		timing := remaining(time.Unix(s.EndsAt, 0))
+		if s.status() != "LIVE" {
+			timing = "ended " + time.Unix(s.EndsAt, 0).Format("2006-01-02 15:04")
+		} else {
+			timing += " left"
+			liveCount++
+			if v, ok := new(big.Int).SetString(s.Stake.String(), 10); ok {
+				escrowed.Add(escrowed, v)
+			}
+		}
+		fmt.Printf("  %-13s %-7s %-28s %10s MOR  %s\n",
+			short(s.ID), s.status(), model, formatWei(s.Stake.String()), timing)
+	}
+
+	fmt.Printf("\n  %d session(s) listed, %d live", len(sessions), liveCount)
+	if liveCount > 0 {
+		fmt.Printf(", %s MOR escrowed in them", formatWei(escrowed.String()))
+	}
+	fmt.Println(".")
+	if !cfg.resolveNames {
+		fmt.Println("  (--resolve-names shows model names instead of ids)")
+	}
+	if len(sessions) == sessionListLimit {
+		fmt.Printf("  (showing the %d most recent; there may be more)\n", sessionListLimit)
+	}
+	return nil
+}
+
 func run(cfg config) error {
 	c, err := newClient(cfg)
 	if err != nil {
@@ -646,6 +778,10 @@ func run(cfg config) error {
 	if cfg.listModels {
 		fmt.Println()
 		return listModels(c, cfg)
+	}
+
+	if cfg.sessions {
+		return showSessions(c, cfg)
 	}
 
 	if !cfg.dev {

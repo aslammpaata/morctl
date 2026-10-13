@@ -144,6 +144,29 @@ choice came from before it opens anything.
   (opening a session that then fails on insufficient MOR — observed
   independently via `mor-cli`, see AUDIT F-series).
 
+## Session visibility
+
+`--sessions` answers the question the session cache cannot: what else is
+open, and what is my MOR tied up in. It reads the wallet address from
+`GET /wallet` and lists `GET /blockchain/sessions/user`, showing model,
+status, escrowed stake and time remaining, plus a total of the stake held
+in live sessions.
+
+Two details that are easy to get wrong:
+
+- `Stake` and `PricePerSecond` arrive as JSON *numbers* in wei, and real
+  values exceed float64's exact range (a 5.6888 MOR stake is
+  5688807051347138757 wei). They are decoded as `json.Number` and
+  formatted through the same `big.Int` path as every other wei value;
+  decoding them as numbers would silently corrupt the amount.
+- Three states matter, not two: `LIVE` (usable), `expired` (past its
+  window, stake on its way back) and `closed` (settled). Collapsing
+  expired into closed hides stake that is still in flight.
+
+Model names are opt-in (`--resolve-names`) because there is no
+single-model lookup endpoint — a name costs a full ~30s marketplace
+fetch, which is too much to impose on a listing command by default.
+
 ## Error translation
 
 A non-2xx router response becomes a `routerError` carrying the method,
