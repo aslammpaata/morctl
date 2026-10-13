@@ -144,6 +144,32 @@ choice came from before it opens anything.
   (opening a session that then fails on insufficient MOR — observed
   independently via `mor-cli`, see AUDIT F-series).
 
+## Error translation
+
+A non-2xx router response becomes a `routerError` carrying the method,
+path, status and body, rather than a flattened string. Display is then
+separate from detection: `renderError` looks the failure up in a
+table of rules and prints a cause and a fix, while `--verbose`/`--json`
+still show the raw response.
+
+Three rules about the table, all learned from how these failures actually
+present:
+
+- **Match on status plus a body substring, never an exact body.** The
+  interesting failures arrive second-hand — an RPC's `over rate limit`
+  or `410 Gone` reaches us wrapped in the router's own 500 — so the
+  status alone is often wrong and the exact wording belongs to whatever
+  the router was proxying.
+- **Never invent a cause.** An unmatched error prints verbatim. A
+  confidently wrong diagnosis costs more than no diagnosis.
+- **Keep the raw text reachable.** Anyone debugging needs the real
+  response, so the translation is additive, never a replacement.
+
+The rules encode the failures this project actually hit: public-RPC
+throttling (the router ships with seven shared public Base endpoints by
+default), dead RPC endpoints, insufficient stake, models with no bids,
+provider disconnects, and cookies rotated by a router restart.
+
 ## Non-goals
 
 - Not an installer for the Desktop App.

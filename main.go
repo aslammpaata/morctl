@@ -46,13 +46,14 @@ type config struct {
 	fresh       bool
 	listModels  bool
 	noHistory   bool
+	verbose     bool
 	cacheFile   string
 }
 
 func main() {
 	cfg := parseFlags()
 	if err := run(cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "✖ "+err.Error())
+		renderError(os.Stderr, err, cfg)
 		os.Exit(1)
 	}
 }
@@ -71,6 +72,7 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.fresh, "fresh", false, "ignore any cached session and open a new one")
 	flag.BoolVar(&cfg.listModels, "list-models", false, "list marketplace models and exit (narrow with --model)")
 	flag.BoolVar(&cfg.noHistory, "no-history", false, "do not store or restore conversation history in the session cache")
+	flag.BoolVar(&cfg.verbose, "verbose", false, "show the raw router response alongside translated errors")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
 	cfg.cacheFile = sessionCacheFile
@@ -173,7 +175,13 @@ func (c *client) do(method, path string, headers map[string]string, body, out an
 		fmt.Printf("  %s %s -> %s\n  %s\n", method, path, resp.Status, snippet(data))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s -> %s: %s", method, path, resp.Status, snippet(data))
+		return &routerError{
+			method: method,
+			path:   path,
+			status: resp.StatusCode,
+			reason: resp.Status,
+			body:   snippet(data),
+		}
 	}
 	if out != nil {
 		if err := json.Unmarshal(data, out); err != nil {
@@ -181,6 +189,177 @@ func (c *client) do(method, path string, headers map[string]string, body, out an
 		}
 	}
 	return nil
+}
+
+// routerError is a non-2xx response from the proxy-router. It keeps the status
+// and body intact so the raw detail is still available under --verbose/--json
+// while the default output can show a plain-language cause and fix instead.
+type routerError struct {
+	method string
+	path   string
+	status int
+	reason string // the HTTP status line, e.g. "429 Too Many Requests"
+	body   string
+}
+
+func (e *routerError) Error() string {
+	return fmt.Sprintf("%s %s -> %s: %s", e.method, e.path, e.reason, e.body)
+}
+
+// diagnosis is a plain-language reading of a router error: what actually went
+// wrong, and what to do about it.
+type diagnosis struct {
+	cause string
+	fix   string
+}
+
+// errorRules maps router failures to plain language. Matching is on status plus
+// a body substring, never on an exact body, because the router's wording and
+// the wording of whatever it is proxying both change independently of morctl.
+// Order matters: the most specific rule wins.
+var errorRules = []struct {
+	// status 0 matches any status; needles are matched case-insensitively and
+	// any one of them is enough.
+	status  int
+	needles []string
+	pathHas string
+	diagnosis
+}{
+	{
+		status:  404,
+		pathHas: "/blockchain/stakes/",
+		diagnosis: diagnosis{
+			cause: "this proxy-router does not have the stake endpoints.",
+			fix:   "They were added in node v7.11.0 -- upgrade the router, or claim manually as the guides describe.",
+		},
+	},
+	{
+		status:  409,
+		pathHas: "/blockchain/stakes/withdraw",
+		diagnosis: diagnosis{
+			cause: "a stake withdrawal is already in flight on this router.",
+			fix:   "Wait for it to finish, then check the on-hold balance again before retrying.",
+		},
+	},
+	{
+		status:  429,
+		needles: nil,
+		diagnosis: diagnosis{
+			cause: "the blockchain RPC endpoint is rate-limiting the router. The public Base RPCs are shared and throttle quickly.",
+			fix:   "Point the router at a dedicated RPC (ETH_NODE_ADDRESS, or POST /config/ethNode), then retry.",
+		},
+	},
+	{
+		needles: []string{"over rate limit", "rate limit", "too many requests", "429"},
+		diagnosis: diagnosis{
+			cause: "the blockchain RPC endpoint is rate-limiting the router. The public Base RPCs are shared and throttle quickly.",
+			fix:   "Point the router at a dedicated RPC (ETH_NODE_ADDRESS, or POST /config/ethNode), then retry.",
+		},
+	},
+	{
+		status: 410,
+		diagnosis: diagnosis{
+			cause: "an upstream RPC endpoint answered 410 Gone -- that endpoint is dead, not merely busy.",
+			fix:   "Replace it: check ETH_NODE_ADDRESS on the router, or POST /config/ethNode with a working URL.",
+		},
+	},
+	{
+		needles: []string{"410 gone"},
+		diagnosis: diagnosis{
+			cause: "an upstream RPC endpoint answered 410 Gone -- that endpoint is dead, not merely busy.",
+			fix:   "Replace it: check ETH_NODE_ADDRESS on the router, or POST /config/ethNode with a working URL.",
+		},
+	},
+	{
+		needles: []string{"insufficient", "not enough", "exceeds balance", "transfer amount exceeds"},
+		diagnosis: diagnosis{
+			cause: "the wallet does not hold enough MOR to stake for this session.",
+			fix:   "Fund the wallet, shorten the session with --duration, or claim any stake on hold (morctl --stakes).",
+		},
+	},
+	{
+		needles: []string{"no bid", "bid not found", "no active bid", "no provider"},
+		diagnosis: diagnosis{
+			cause: "no provider is currently bidding on this model, so there is nothing to open a session against.",
+			fix:   "Pick a different model (morctl --list-models), or check GET /healthcheck for this model's status.",
+		},
+	},
+	{
+		needles: []string{"provider disconnect", "provider unreachable", "connection refused", "dial tcp", "unexpected eof", "connection reset", "no such host"},
+		diagnosis: diagnosis{
+			cause: "the provider serving this session dropped the connection.",
+			fix:   "Retry -- the session is still open and paid for. If it keeps failing, the provider is unhealthy; choose another model.",
+		},
+	},
+	{
+		status: 401,
+		diagnosis: diagnosis{
+			cause: "the router rejected the credentials.",
+			fix:   "The .cookie file is regenerated when the router restarts: re-read it (--cookie / COOKIE_FILE_PATH) or re-export MORPHEUS_ROUTER_AUTH.",
+		},
+	},
+	{
+		status: 403,
+		diagnosis: diagnosis{
+			cause: "these credentials are not allowed to perform that action.",
+			fix:   "A scoped router user needs the matching permission (open_session, chat, get_stakes_on_hold, withdraw_user_stakes).",
+		},
+	},
+	{
+		status: 402,
+		diagnosis: diagnosis{
+			cause: "the provider's own model backend refused the request for payment reasons.",
+			fix:   "That is the provider's billing, not yours -- choose another model.",
+		},
+	},
+}
+
+// friendly returns a plain-language reading of the error, if one is known.
+func (e *routerError) friendly() (diagnosis, bool) {
+	body := strings.ToLower(e.body)
+	for _, rule := range errorRules {
+		if rule.status != 0 && rule.status != e.status {
+			continue
+		}
+		if rule.pathHas != "" && !strings.Contains(e.path, rule.pathHas) {
+			continue
+		}
+		if len(rule.needles) > 0 {
+			matched := false
+			for _, n := range rule.needles {
+				if strings.Contains(body, n) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		return rule.diagnosis, true
+	}
+	return diagnosis{}, false
+}
+
+// renderError writes an error to stderr, translating router failures into a
+// cause and a fix where one is known. The raw error is always shown under
+// --verbose or --json, and is shown anyway when there is no translation, so
+// nothing is ever hidden from the person debugging.
+func renderError(w io.Writer, err error, cfg config) {
+	var re *routerError
+	if errors.As(err, &re) {
+		if d, ok := re.friendly(); ok {
+			fmt.Fprintf(w, "✖ %s\n", d.cause)
+			fmt.Fprintf(w, "  → %s\n", d.fix)
+			if cfg.verbose || cfg.jsonOut {
+				fmt.Fprintf(w, "  raw: %v\n", err)
+			} else {
+				fmt.Fprintf(w, "  (%s %s -> %s; --verbose for the full response)\n", re.method, re.path, re.reason)
+			}
+			return
+		}
+	}
+	fmt.Fprintf(w, "✖ %v\n", err)
 }
 
 // reachable reports whether the router answers HTTP at all. Any HTTP response
@@ -439,8 +618,22 @@ func run(cfg config) error {
 	}
 	fmt.Println("✔ router reachable")
 
+	balanceOK := true
 	if bal, err := c.balance(); err != nil {
-		fmt.Printf("  (wallet balance unavailable: %v)\n", err)
+		balanceOK = false
+		// A balance failure is not fatal to a preflight, but it is usually the
+		// first place a stale cookie or a throttled RPC shows up, so say what
+		// it means rather than echoing the status line.
+		var re *routerError
+		if errors.As(err, &re) {
+			if d, ok := re.friendly(); ok {
+				fmt.Printf("  ⚠ wallet balance unavailable: %s\n    → %s\n", d.cause, d.fix)
+			} else {
+				fmt.Printf("  ⚠ wallet balance unavailable (%s)\n", re.reason)
+			}
+		} else {
+			fmt.Printf("  ⚠ wallet balance unavailable: %v\n", err)
+		}
 	} else {
 		fmt.Printf("  wallet: %s MOR, %s ETH\n", formatWei(bal.MOR), formatWei(bal.ETH))
 		if morF, err := weiToFloat(bal.MOR); err == nil {
@@ -456,6 +649,12 @@ func run(cfg config) error {
 	}
 
 	if !cfg.dev {
+		if !balanceOK {
+			// The router is up but we could not read the wallet, so this is not
+			// a clean bill of health -- don't claim one.
+			fmt.Println("\nRouter is reachable, but the wallet could not be read (see above).")
+			return nil
+		}
 		fmt.Println("\nPreflight OK. Re-run with --dev --model-id 0x... to open a session and run inference.")
 		return nil
 	}
@@ -670,7 +869,7 @@ func interactiveLoop(c *client, cfg config, sessionID string, exp time.Time, his
 		history = append(history, message{Role: "user", Content: line})
 		reply, err := c.chat(sessionID, cfg.model, cfg.modelID, history)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "✖ "+err.Error())
+			renderError(os.Stderr, err, cfg)
 			history = history[:len(history)-1] // don't poison history with a failed turn
 			continue
 		}

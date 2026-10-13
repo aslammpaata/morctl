@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -988,6 +990,215 @@ func TestChatEmptyChoicesIsAnError(t *testing.T) {
 	})
 	if _, err := c.chat("0xsess", "m", "0xmodel", []message{{Role: "user", Content: "hi"}}); err == nil {
 		t.Fatal("want an error when the router returns no choices")
+	}
+}
+
+// --- friendly error translation --------------------------------------------
+
+func TestRouterErrorFriendly(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      routerError
+		wantOK   bool
+		inCause  []string
+		inFix    []string
+		notCause []string
+	}{
+		{
+			name:    "429 is read as RPC throttling",
+			err:     routerError{status: 429, reason: "429 Too Many Requests", body: `{"error":"request failed"}`},
+			wantOK:  true,
+			inCause: []string{"rate-limiting"},
+			inFix:   []string{"ETH_NODE_ADDRESS"},
+		},
+		{
+			name:    "an over-rate-limit body is caught even behind a 500",
+			err:     routerError{status: 500, reason: "500 Internal Server Error", body: `{"error":"internal error: 429 Too Many Requests: {\"message\":\"over rate limit\"}"}`},
+			wantOK:  true,
+			inCause: []string{"rate-limiting"},
+			inFix:   []string{"dedicated RPC"},
+		},
+		{
+			name:    "410 is a dead endpoint, not a busy one",
+			err:     routerError{status: 410, reason: "410 Gone", body: `{"error":"gone"}`},
+			wantOK:  true,
+			inCause: []string{"dead"},
+			inFix:   []string{"ETH_NODE_ADDRESS"},
+		},
+		{
+			name:    "an upstream 410 reported through a 500 is still recognised",
+			err:     routerError{status: 500, reason: "500 Internal Server Error", body: `{"error":"eth node returned 410 Gone"}`},
+			wantOK:  true,
+			inCause: []string{"dead"},
+		},
+		{
+			name:    "insufficient balance",
+			err:     routerError{status: 500, reason: "500 Internal Server Error", body: `{"error":"execution reverted: ERC20: insufficient allowance"}`},
+			wantOK:  true,
+			inCause: []string{"MOR"},
+			inFix:   []string{"--duration"},
+		},
+		{
+			name:    "no bids for the model",
+			err:     routerError{status: 400, reason: "400 Bad Request", body: `{"error":"no bid found for model"}`},
+			wantOK:  true,
+			inCause: []string{"provider"},
+			inFix:   []string{"--list-models"},
+		},
+		{
+			name:    "provider disconnect mid-session",
+			err:     routerError{status: 502, reason: "502 Bad Gateway", body: `{"error":"post to provider failed: unexpected EOF"}`},
+			wantOK:  true,
+			inCause: []string{"dropped the connection"},
+			inFix:   []string{"still open"},
+		},
+		{
+			name:    "401 points at cookie rotation",
+			err:     routerError{status: 401, reason: "401 Unauthorized", body: `{"error":"unauthorized"}`},
+			wantOK:  true,
+			inCause: []string{"credentials"},
+			inFix:   []string{".cookie", "restarts"},
+		},
+		{
+			name:    "403 points at scoped permissions",
+			err:     routerError{status: 403, reason: "403 Forbidden", body: `{"error":"method not allowed"}`},
+			wantOK:  true,
+			inCause: []string{"not allowed"},
+			inFix:   []string{"permission"},
+		},
+		{
+			name:    "a 404 on the stake endpoints means the router is too old",
+			err:     routerError{status: 404, path: "/blockchain/stakes/onhold", reason: "404 Not Found", body: `404 page not found`},
+			wantOK:  true,
+			inCause: []string{"stake endpoints"},
+			inFix:   []string{"v7.11.0"},
+		},
+		{
+			name:    "a 409 on withdraw means one is already running",
+			err:     routerError{status: 409, path: "/blockchain/stakes/withdraw", reason: "409 Conflict", body: `{"error":"operation exists or journal unavailable"}`},
+			wantOK:  true,
+			inCause: []string{"already in flight"},
+		},
+		{
+			name:   "an unrecognised failure is not given a made-up cause",
+			err:    routerError{status: 418, reason: "418 I'm a teapot", body: `{"error":"short and stout"}`},
+			wantOK: false,
+		},
+		{
+			name:   "a plain 404 elsewhere is not treated as a stake problem",
+			err:    routerError{status: 404, path: "/blockchain/models", reason: "404 Not Found", body: `404 page not found`},
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tc.err.friendly()
+			if ok != tc.wantOK {
+				t.Fatalf("friendly() ok = %v, want %v (got %+v)", ok, tc.wantOK, got)
+			}
+			if !ok {
+				return
+			}
+			for _, want := range tc.inCause {
+				if !strings.Contains(got.cause, want) {
+					t.Errorf("cause %q should contain %q", got.cause, want)
+				}
+			}
+			for _, want := range tc.inFix {
+				if !strings.Contains(got.fix, want) {
+					t.Errorf("fix %q should contain %q", got.fix, want)
+				}
+			}
+			if got.cause == "" || got.fix == "" {
+				t.Error("a translated error must carry both a cause and a fix")
+			}
+		})
+	}
+}
+
+func TestRenderError(t *testing.T) {
+	throttled := &routerError{
+		method: http.MethodPost, path: "/blockchain/models/0xabc/session",
+		status: 429, reason: "429 Too Many Requests",
+		body: `{"error":"over rate limit"}`,
+	}
+
+	t.Run("default output shows the cause and the fix", func(t *testing.T) {
+		var buf strings.Builder
+		renderError(&buf, fmt.Errorf("open session: %w", throttled), config{})
+		out := buf.String()
+		if !strings.Contains(out, "rate-limiting") {
+			t.Errorf("want a translated cause, got:\n%s", out)
+		}
+		if !strings.Contains(out, "ETH_NODE_ADDRESS") {
+			t.Errorf("want a suggested fix, got:\n%s", out)
+		}
+		// The status is still there for orientation, and --verbose is offered.
+		if !strings.Contains(out, "429") || !strings.Contains(out, "--verbose") {
+			t.Errorf("want the status and a pointer to --verbose, got:\n%s", out)
+		}
+	})
+
+	t.Run("--verbose keeps the raw response", func(t *testing.T) {
+		var buf strings.Builder
+		renderError(&buf, fmt.Errorf("open session: %w", throttled), config{verbose: true})
+		out := buf.String()
+		if !strings.Contains(out, "over rate limit") {
+			t.Errorf("--verbose must show the raw body, got:\n%s", out)
+		}
+		if !strings.Contains(out, "rate-limiting") {
+			t.Errorf("--verbose must keep the translation too, got:\n%s", out)
+		}
+	})
+
+	t.Run("--json keeps the raw response", func(t *testing.T) {
+		var buf strings.Builder
+		renderError(&buf, throttled, config{jsonOut: true})
+		if !strings.Contains(buf.String(), "over rate limit") {
+			t.Errorf("--json must show the raw body, got:\n%s", buf.String())
+		}
+	})
+
+	t.Run("an untranslatable error is printed verbatim", func(t *testing.T) {
+		var buf strings.Builder
+		renderError(&buf, errors.New("router unreachable at http://localhost:8082"), config{})
+		out := buf.String()
+		if !strings.Contains(out, "router unreachable") {
+			t.Errorf("want the original message, got:\n%s", out)
+		}
+		if strings.Contains(out, "→") {
+			t.Errorf("no fix should be invented for an unknown error, got:\n%s", out)
+		}
+	})
+}
+
+// TestTranslationReachesTheRealErrorPath checks the wiring, not just the table:
+// a throttled router response must come back as a *routerError through the
+// wrapping that devFlow applies.
+func TestTranslationReachesTheRealErrorPath(t *testing.T) {
+	const modelID = "0x1111111111111111111111111111111111111111111111111111111111111111"
+	c, srv := newMockRouter(t, map[string]http.HandlerFunc{
+		"GET /blockchain/models": modelsRoute(),
+		"POST /blockchain/models/" + modelID + "/session": statusRoute(
+			http.StatusTooManyRequests, `{"error":"over rate limit"}`),
+	})
+	cfg := config{modelID: modelID, duration: 600, dev: true, cacheFile: tempCache(t), host: srv.URL}
+	err := devFlow(c, cfg)
+	if err == nil {
+		t.Fatal("want an error from a throttled session open")
+	}
+	var re *routerError
+	if !errors.As(err, &re) {
+		t.Fatalf("error should unwrap to *routerError, got %T: %v", err, err)
+	}
+	if re.status != 429 {
+		t.Errorf("status = %d, want 429", re.status)
+	}
+	var buf strings.Builder
+	renderError(&buf, err, cfg)
+	if !strings.Contains(buf.String(), "rate-limiting") {
+		t.Errorf("the real error path must be translated, got:\n%s", buf.String())
 	}
 }
 
