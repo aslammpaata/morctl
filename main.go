@@ -31,6 +31,8 @@ const (
 	lowMorWarningMOR  = 5.0 // heads-up threshold, not a hard block
 	sessionListLimit  = 20  // most recent sessions shown by --sessions
 	sessionSafetyMarg = 30 * time.Second
+	baseChainID       = int64(8453) // Base mainnet
+	baseChainIDHex    = "0x2105"    // 8453, as an RPC reports it
 )
 
 type config struct {
@@ -53,6 +55,7 @@ type config struct {
 	stakes       bool
 	claimStakes  bool
 	confirm      bool
+	diagnose     bool
 	cacheFile    string
 }
 
@@ -84,6 +87,7 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.stakes, "stakes", false, "show MOR stake on hold for this wallet and exit")
 	flag.BoolVar(&cfg.claimStakes, "claim-stakes", false, "withdraw releasable stake (requires --confirm; sends a transaction)")
 	flag.BoolVar(&cfg.confirm, "confirm", false, "confirm an action that sends a transaction")
+	flag.BoolVar(&cfg.diagnose, "diagnose", false, "check router, credentials, chain, RPC, funds and model health, then exit")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
 	cfg.cacheFile = sessionCacheFile
@@ -863,12 +867,350 @@ func isTerminal(f *os.File) bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
+// --- diagnose ---------------------------------------------------------------
+
+// healthResp is GET /healthcheck. The endpoint is unauthenticated, so it still
+// answers when the cookie is stale -- which is what makes it the right first
+// check in a diagnosis. It answers 503 when degraded, so the body has to be
+// read regardless of status.
+type healthResp struct {
+	Status     string            `json:"status"`
+	Version    string            `json:"version"`
+	Uptime     string            `json:"uptime"`
+	Components map[string]string `json:"components"`
+	Models     []struct {
+		ModelID      string `json:"modelId"`
+		ModelName    string `json:"modelName"`
+		Status       string `json:"status"`
+		ErrorKind    string `json:"errorKind"`
+		HasActiveBid bool   `json:"hasActiveBid"`
+		HTTPStatus   int    `json:"httpStatus"`
+	} `json:"models"`
+}
+
+// healthcheck reads /healthcheck, tolerating the 503 the router returns when a
+// component is unhealthy -- the body is the diagnosis we want in that case.
+func (c *client) healthcheck() (healthResp, int, error) {
+	var h healthResp
+	req, err := http.NewRequest(http.MethodGet, c.base+"/healthcheck", nil)
+	if err != nil {
+		return h, 0, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return h, 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return h, resp.StatusCode, err
+	}
+	if err := json.Unmarshal(data, &h); err != nil {
+		return h, resp.StatusCode, fmt.Errorf("unexpected /healthcheck body: %s", snippet(data))
+	}
+	return h, resp.StatusCode, nil
+}
+
+// routerConfig is the part of GET /config a diagnosis needs.
+type routerConfig struct {
+	Version       string
+	DerivedConfig struct {
+		WalletAddress string
+		ChainID       int64
+		EthNodeURLs   []string
+	}
+	Config struct {
+		Marketplace struct {
+			DiamondContractAddress string
+		}
+	}
+}
+
+func (c *client) config() (routerConfig, error) {
+	var rc routerConfig
+	err := c.do(http.MethodGet, "/config", nil, nil, &rc)
+	return rc, err
+}
+
+// probeRPC asks an RPC endpoint for its chain id. This is the one request
+// morctl makes that does not go to the router: a rate-limited or dead RPC is
+// invisible from the router's own API but is the single most common cause of
+// session failures, and the default config ships seven shared public endpoints.
+func probeRPC(url string, timeout time.Duration) (chainID string, status int, err error) {
+	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}`)
+	req, err := http.NewRequest(http.MethodPost, url, body)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", resp.StatusCode, fmt.Errorf("%s: %s", resp.Status, snippet(data))
+	}
+	var out struct {
+		Result string `json:"result"`
+		Error  struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "", resp.StatusCode, fmt.Errorf("unexpected RPC body: %s", snippet(data))
+	}
+	if out.Error.Message != "" {
+		return "", resp.StatusCode, errors.New(out.Error.Message)
+	}
+	return out.Result, resp.StatusCode, nil
+}
+
+// check is one line of a diagnosis.
+type check struct {
+	name   string
+	state  string // "ok", "warn" or "fail"
+	detail string
+	fix    string
+}
+
+type report struct {
+	checks []check
+	// unreachable records that the router itself could not be contacted, so
+	// the absence of the other checks is expected rather than a clean result.
+	unreachable bool
+}
+
+// find returns the check with the given name, for assertions and lookups.
+func (r *report) find(name string) (check, bool) {
+	for _, c := range r.checks {
+		if c.name == name {
+			return c, true
+		}
+	}
+	return check{}, false
+}
+
+func (r *report) add(name, state, detail, fix string) {
+	r.checks = append(r.checks, check{name: name, state: state, detail: detail, fix: fix})
+}
+
+func (r *report) ok(name, detail string)        { r.add(name, "ok", detail, "") }
+func (r *report) warn(name, detail, fix string) { r.add(name, "warn", detail, fix) }
+func (r *report) fail(name, detail, fix string) { r.add(name, "fail", detail, fix) }
+func (r *report) failed() bool {
+	for _, c := range r.checks {
+		if c.state == "fail" {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *report) print(w io.Writer) {
+	symbol := map[string]string{"ok": "✔", "warn": "⚠", "fail": "✖"}
+	for _, c := range r.checks {
+		fmt.Fprintf(w, "  %s %-22s %s\n", symbol[c.state], c.name, c.detail)
+		if c.fix != "" {
+			fmt.Fprintf(w, "      → %s\n", c.fix)
+		}
+	}
+}
+
+// diagnose runs the checks that explain why session/inference work is failing,
+// in dependency order, and never stops at the first problem: a broken cookie
+// should not hide a wrong chain id.
+func diagnose(c *client, cfg config) error {
+	fmt.Printf("\n> diagnosing %s\n\n", c.base)
+	r := runChecks(c, cfg)
+	r.print(os.Stdout)
+	fmt.Println()
+	switch {
+	case r.unreachable:
+		return errors.New("router unreachable -- no further checks possible")
+	case r.failed():
+		return errors.New("diagnosis found problems (see ✖ above)")
+	}
+	fmt.Println("  No blocking problems found.")
+	return nil
+}
+
+// runChecks performs the diagnosis and returns the report, so the outcome can
+// be asserted on rather than only printed.
+func runChecks(c *client, cfg config) *report {
+	r := &report{}
+
+	// 1. Router process. Unauthenticated, so this works with a bad cookie.
+	h, status, err := c.healthcheck()
+	switch {
+	case err != nil && status == 0:
+		r.fail("router", "not reachable: "+err.Error(),
+			"Start the Desktop App, or run the proxy-router with your .env.")
+		// Nothing else can be checked without the router.
+		r.unreachable = true
+		return r
+	case err != nil:
+		r.warn("router", fmt.Sprintf("answered %d but the body was unreadable", status), err.Error())
+	case h.Status == "healthy":
+		r.ok("router", fmt.Sprintf("healthy, %s, up %s", h.Version, h.Uptime))
+	default:
+		r.fail("router", fmt.Sprintf("%s (%s, up %s)", h.Status, h.Version, h.Uptime),
+			"See the component detail below.")
+	}
+
+	// 2. Router components, e.g. the badger store that has corrupted before.
+	for name, state := range h.Components {
+		if strings.HasPrefix(state, "unhealthy") {
+			r.fail("component "+name, state,
+				"Local state may be corrupt; stopping the router and clearing its data directory has fixed this before.")
+		} else {
+			r.ok("component "+name, state)
+		}
+	}
+
+	// 3. Credentials. Any authenticated endpoint will do; /wallet is cheap and
+	// its answer is needed by later checks anyway.
+	addr, walletErr := c.walletAddress()
+	if walletErr != nil {
+		var re *routerError
+		if errors.As(walletErr, &re) && (re.status == 401 || re.status == 403) {
+			d, _ := re.friendly()
+			r.fail("credentials", "rejected by the router", d.fix)
+		} else {
+			r.warn("credentials", "could not be verified", walletErr.Error())
+		}
+	} else {
+		r.ok("credentials", "accepted (wallet "+addr+")")
+	}
+
+	// 4. Chain and RPC configuration.
+	rc, cfgErr := c.config()
+	if cfgErr != nil {
+		r.warn("router config", "unavailable", "Needs credentials with the system_config permission.")
+	} else {
+		if rc.DerivedConfig.ChainID == baseChainID {
+			r.ok("chain id", fmt.Sprintf("%d (Base)", rc.DerivedConfig.ChainID))
+		} else {
+			r.fail("chain id", fmt.Sprintf("%d, expected %d (Base mainnet)", rc.DerivedConfig.ChainID, baseChainID),
+				"Set ETH_NODE_CHAIN_ID=8453 and point ETH_NODE_ADDRESS at a Base RPC.")
+		}
+
+		urls := rc.DerivedConfig.EthNodeURLs
+		switch {
+		case len(urls) == 0:
+			r.fail("rpc endpoints", "none configured",
+				"Set ETH_NODE_ADDRESS, or POST /config/ethNode with a working URL.")
+		default:
+			r.ok("rpc endpoints", fmt.Sprintf("%d configured", len(urls)))
+			// Probe the first endpoint only: this is a diagnosis, not a sweep,
+			// and hammering shared endpoints is the problem we are looking for.
+			chainHex, st, probeErr := probeRPC(urls[0], 10*time.Second)
+			switch {
+			case st == 429:
+				r.fail("rpc reachable", urls[0]+" is rate-limiting us (429)",
+					"These are shared public endpoints. Use a dedicated RPC (ETH_NODE_ADDRESS, or POST /config/ethNode).")
+			case st == 410:
+				r.fail("rpc reachable", urls[0]+" answered 410 Gone -- the endpoint is dead",
+					"Replace it via ETH_NODE_ADDRESS or POST /config/ethNode.")
+			case probeErr != nil:
+				r.fail("rpc reachable", urls[0]+": "+probeErr.Error(),
+					"Check the URL and this machine's outbound network access.")
+			case chainHex != baseChainIDHex:
+				r.warn("rpc reachable", fmt.Sprintf("%s reports chain %s, not %s (Base)", urls[0], chainHex, baseChainIDHex),
+					"The RPC and the configured chain id disagree.")
+			default:
+				r.ok("rpc reachable", fmt.Sprintf("%s (chain %s)", urls[0], chainHex))
+			}
+		}
+	}
+
+	// 5. Funds: balance, allowance and stake on hold.
+	if walletErr == nil {
+		if bal, err := c.balance(); err != nil {
+			r.warn("balance", "unavailable", "Usually the same cause as any credential or RPC failure above.")
+		} else {
+			morF, _ := weiToFloat(bal.MOR)
+			mor, _ := morF.Float64()
+			detail := fmt.Sprintf("%s MOR, %s ETH", formatWei(bal.MOR), formatWei(bal.ETH))
+			if mor < lowMorWarningMOR {
+				r.warn("balance", detail, fmt.Sprintf("Sessions stake MOR; under ~%.0f MOR some will fail to open.", lowMorWarningMOR))
+			} else {
+				r.ok("balance", detail)
+			}
+		}
+
+		if cfgErr == nil {
+			if diamond := rc.Config.Marketplace.DiamondContractAddress; diamond != "" {
+				var a struct {
+					Allowance json.Number `json:"allowance"`
+				}
+				if err := c.do(http.MethodGet, "/blockchain/allowance?spender="+diamond, nil, nil, &a); err != nil {
+					r.warn("allowance", "unavailable", "Sessions need an allowance for the Diamond contract.")
+				} else if a.Allowance.String() == "0" || a.Allowance.String() == "" {
+					r.fail("allowance", "0 MOR approved for the Diamond contract",
+						"Approve an allowance before opening sessions (mor-cli approveAllowance, or the Desktop App).")
+				} else {
+					r.ok("allowance", formatWei(a.Allowance.String())+" MOR approved for the Diamond")
+				}
+			}
+		}
+
+		if s, err := c.stakes(); err != nil {
+			var re *routerError
+			if errors.As(walletErr, &re) || errors.As(err, &re) && re.status == 404 {
+				r.warn("stake on hold", "not exposed by this router", "Added in node v7.11.0; upgrade to see and claim it.")
+			}
+		} else if s.claimable() {
+			r.warn("stake on hold", formatWei(s.Available)+" MOR claimable", "Claim it: morctl --claim-stakes --confirm")
+		} else if s.any() {
+			r.ok("stake on hold", formatWei(s.Hold)+" MOR locked (released 24h after an early close)")
+		} else {
+			r.ok("stake on hold", "none")
+		}
+	}
+
+	// 6. Per-model health, which the router has reported since 7.5.0 and which
+	// neither CLI used to surface.
+	var unhealthy, throttled int
+	for _, m := range h.Models {
+		if m.Status == "unhealthy" {
+			unhealthy++
+		}
+		if m.ErrorKind == "rate_limited" {
+			throttled++
+		}
+	}
+	switch {
+	case len(h.Models) == 0:
+		// Consumer nodes report no models; only providers probe their own.
+		r.ok("model health", "no per-model reports (normal for a consumer node)")
+	case throttled > 0:
+		r.warn("model health", fmt.Sprintf("%d of %d model(s) rate-limited", throttled, len(h.Models)),
+			"The provider's backend is throttling; prefer another model.")
+	case unhealthy > 0:
+		r.warn("model health", fmt.Sprintf("%d of %d model(s) unhealthy", unhealthy, len(h.Models)),
+			"Pick a model whose provider is healthy (morctl --list-models).")
+	default:
+		r.ok("model health", fmt.Sprintf("%d model(s) reporting, none unhealthy", len(h.Models)))
+	}
+
+	return r
+}
+
 func run(cfg config) error {
 	c, err := newClient(cfg)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("morctl  ->  %s\n", c.base)
+
+	// --diagnose runs its own reachability check (via the unauthenticated
+	// /healthcheck, so it still reports something useful when the cookie is
+	// stale) and replaces the normal preflight output.
+	if cfg.diagnose {
+		return diagnose(c, cfg)
+	}
 
 	if err := c.reachable(); err != nil {
 		fmt.Println("✖ router not reachable")

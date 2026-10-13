@@ -144,6 +144,42 @@ choice came from before it opens anything.
   (opening a session that then fails on insufficient MOR — observed
   independently via `mor-cli`, see AUDIT F-series).
 
+## Diagnose
+
+`--diagnose` is the doctor-scope core: it answers "why can't I open a
+session" in one command, checking router process and components,
+credentials, chain id, RPC reachability, balance, allowance, stake on
+hold and per-model health.
+
+Three rules shape it:
+
+- **Order by dependency, but never stop at the first failure.** A
+  rejected cookie must not hide a wrong chain id, so every independent
+  check still runs and the report shows them all. Only an unreachable
+  router short-circuits, because nothing else is knowable then.
+- **Start with the unauthenticated endpoint.** `/healthcheck` needs no
+  credentials, so the router version, uptime, component health and
+  per-model status are still reported when the cookie is stale —
+  exactly the case a user is most likely to be debugging. It answers
+  503 when degraded, so the body is parsed regardless of status: that
+  body *is* the diagnosis.
+- **One probe, not a sweep.** The RPC check calls `eth_chainId` against
+  the first configured endpoint only. Hammering shared public endpoints
+  is the very failure being diagnosed, and the router ships with seven
+  of them by default.
+
+Three severities, deliberately distinguished: `✖` blocks session work
+(and exits 1, so scripts can gate on it), `⚠` is worth knowing (low
+balance, claimable stake, a throttled model), `✔` passes. Every non-pass
+carries a fix. This is also the one place morctl talks to something
+other than the router — a rate-limited or dead RPC is invisible from the
+router's own API yet is the most common cause of session failures.
+
+Per-model health comes from the `models[]` block the router has exposed
+since v7.5.0, which neither CLI previously surfaced. It is the
+provider's self-report, not an independent probe, and it is reported as
+such.
+
 ## Stake on hold, and claiming it
 
 Closing a session early does not refund the stake immediately: the
@@ -232,7 +268,9 @@ provider disconnects, and cookies rotated by a router restart.
 - Not a general-purpose replacement for `mor-cli` or the router's HTTP
   API — a thin, honest wrapper around the one specific painful workflow
   (session → inference), not a full admin CLI.
-- Not a health-check for individual models/providers (router-level only).
+- Not an independent prober of model/provider health: `--diagnose` relays
+  the provider self-reports the router already publishes, it does not
+  test providers itself.
 
 ## Next candidates (not yet built)
 

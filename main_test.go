@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1186,6 +1187,276 @@ func TestShowSessions(t *testing.T) {
 		var re *routerError
 		if !errors.As(err, &re) {
 			t.Errorf("error should unwrap to *routerError for translation, got %T", err)
+		}
+	})
+}
+
+// --- diagnose ---------------------------------------------------------------
+
+// rpcServer stands in for a Base RPC endpoint.
+func rpcServer(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func okRPC(chainHex string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"` + chainHex + `"}`))
+	}
+}
+
+// healthyRoutes is a router that passes every check, which each test then
+// breaks in exactly one way.
+func healthyRoutes(rpcURL string) map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"GET /healthcheck": jsonRoute(`{"status":"healthy","version":"v7.14.0","uptime":"1h0m0s",
+			"components":{"badgerdb":"healthy, size=1.0MB"},
+			"models":[{"modelId":"0xaaa","status":"healthy","hasActiveBid":true}]}`),
+		"GET /wallet": jsonRoute(`{"address":"0xffd9883a"}`),
+		"GET /config": jsonRoute(`{"Version":"v7.14.0","DerivedConfig":{"WalletAddress":"0xffd9883a","ChainID":8453,
+			"EthNodeURLs":["` + rpcURL + `"]},"Config":{"Marketplace":{"DiamondContractAddress":"0xdiamond"}}}`),
+		"GET /blockchain/balance":       jsonRoute(`{"eth":"1000000000000000000","mor":"50000000000000000000"}`),
+		"GET /blockchain/allowance":     jsonRoute(`{"allowance":"14482038714754728536"}`),
+		"GET /blockchain/stakes/onhold": jsonRoute(`{"available":"0","hold":"0"}`),
+	}
+}
+
+func TestDiagnoseHealthy(t *testing.T) {
+	rpc := rpcServer(t, okRPC("0x2105"))
+	c, _ := newMockRouter(t, healthyRoutes(rpc))
+	r := runChecks(c, config{})
+	if r.failed() {
+		for _, chk := range r.checks {
+			if chk.state == "fail" {
+				t.Errorf("unexpected failure: %s -- %s", chk.name, chk.detail)
+			}
+		}
+	}
+	if r.unreachable {
+		t.Error("the router was reachable")
+	}
+	for _, want := range []string{"router", "credentials", "chain id", "rpc reachable", "balance", "allowance", "stake on hold", "model health"} {
+		if _, ok := r.find(want); !ok {
+			t.Errorf("no %q check in the report", want)
+		}
+	}
+}
+
+func TestDiagnoseFailures(t *testing.T) {
+	t.Run("router down stops after the first check", func(t *testing.T) {
+		c, srv := newMockRouter(t, map[string]http.HandlerFunc{})
+		srv.Close()
+		r := runChecks(c, config{})
+		if !r.unreachable {
+			t.Error("want unreachable set")
+		}
+		if len(r.checks) != 1 {
+			t.Errorf("want a single check when the router is down, got %d", len(r.checks))
+		}
+		if err := diagnose(c, config{}); err == nil {
+			t.Error("diagnose must report an error when the router is down")
+		}
+	})
+
+	t.Run("a degraded component is a failure with a fix", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /healthcheck"] = statusRoute(http.StatusServiceUnavailable,
+			`{"status":"degraded","version":"v7.14.0","uptime":"1h",
+			  "components":{"badgerdb":"unhealthy: manifest corrupted"}}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		// The 503 body must still be parsed -- it carries the diagnosis.
+		chk, ok := r.find("component badgerdb")
+		if !ok {
+			t.Fatal("the component detail from a 503 body was lost")
+		}
+		if chk.state != "fail" || !strings.Contains(chk.detail, "corrupted") {
+			t.Errorf("component check = %+v", chk)
+		}
+		if chk.fix == "" {
+			t.Error("a corrupt store should come with a suggested fix")
+		}
+		if !r.failed() {
+			t.Error("a degraded router must fail the diagnosis")
+		}
+	})
+
+	t.Run("a stale cookie fails credentials but keeps checking", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /wallet"] = statusRoute(http.StatusUnauthorized, `{"error":"invalid username or password"}`)
+		routes["GET /config"] = statusRoute(http.StatusUnauthorized, `{"error":"invalid username or password"}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+
+		creds, _ := r.find("credentials")
+		if creds.state != "fail" {
+			t.Errorf("credentials check = %+v, want fail", creds)
+		}
+		if !strings.Contains(creds.fix, ".cookie") {
+			t.Errorf("fix should point at the cookie, got %q", creds.fix)
+		}
+		// The point of using the unauthenticated healthcheck first: the router
+		// and model health are still reported despite the bad cookie.
+		if router, _ := r.find("router"); router.state != "ok" {
+			t.Errorf("router check = %+v, want ok even with a bad cookie", router)
+		}
+		if _, ok := r.find("model health"); !ok {
+			t.Error("model health should still be reported with a bad cookie")
+		}
+	})
+
+	t.Run("wrong chain id is a failure", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0xaa36a7")) // Sepolia
+		routes := healthyRoutes(rpc)
+		routes["GET /config"] = jsonRoute(`{"DerivedConfig":{"ChainID":11155111,"EthNodeURLs":["` + rpc + `"]},
+			"Config":{"Marketplace":{"DiamondContractAddress":"0xdiamond"}}}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		chk, ok := r.find("chain id")
+		if !ok || chk.state != "fail" {
+			t.Fatalf("chain id check = %+v, want fail", chk)
+		}
+		if !strings.Contains(chk.fix, "8453") {
+			t.Errorf("fix should name the expected chain, got %q", chk.fix)
+		}
+	})
+
+	t.Run("a rate-limited RPC is called out specifically", func(t *testing.T) {
+		rpc := rpcServer(t, statusRoute(http.StatusTooManyRequests, `{"message":"over rate limit"}`))
+		c, _ := newMockRouter(t, healthyRoutes(rpc))
+		r := runChecks(c, config{})
+		chk, ok := r.find("rpc reachable")
+		if !ok || chk.state != "fail" {
+			t.Fatalf("rpc check = %+v, want fail", chk)
+		}
+		if !strings.Contains(chk.detail, "429") {
+			t.Errorf("detail should name the throttling, got %q", chk.detail)
+		}
+		if !strings.Contains(chk.fix, "dedicated RPC") {
+			t.Errorf("fix should suggest a dedicated RPC, got %q", chk.fix)
+		}
+	})
+
+	t.Run("a dead RPC endpoint is distinguished from a busy one", func(t *testing.T) {
+		rpc := rpcServer(t, statusRoute(http.StatusGone, `gone`))
+		c, _ := newMockRouter(t, healthyRoutes(rpc))
+		r := runChecks(c, config{})
+		chk, _ := r.find("rpc reachable")
+		if chk.state != "fail" || !strings.Contains(chk.detail, "410") {
+			t.Errorf("rpc check = %+v, want a 410-specific failure", chk)
+		}
+	})
+
+	t.Run("an RPC on the wrong chain warns", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x1")) // Ethereum mainnet
+		c, _ := newMockRouter(t, healthyRoutes(rpc))
+		r := runChecks(c, config{})
+		chk, _ := r.find("rpc reachable")
+		if chk.state != "warn" {
+			t.Errorf("rpc check = %+v, want warn when the RPC chain disagrees", chk)
+		}
+	})
+
+	t.Run("low MOR warns rather than fails", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /blockchain/balance"] = jsonRoute(`{"eth":"1000000000000000000","mor":"1000000000000000000"}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		chk, _ := r.find("balance")
+		if chk.state != "warn" {
+			t.Errorf("balance check = %+v, want warn at 1 MOR", chk)
+		}
+		// A low balance is a heads-up, not a blocker.
+		if r.failed() {
+			t.Error("a low balance alone must not fail the diagnosis")
+		}
+	})
+
+	t.Run("a zero allowance is a failure", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /blockchain/allowance"] = jsonRoute(`{"allowance":"0"}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		chk, _ := r.find("allowance")
+		if chk.state != "fail" {
+			t.Errorf("allowance check = %+v, want fail at 0", chk)
+		}
+	})
+
+	t.Run("claimable stake is surfaced as a warning", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /blockchain/stakes/onhold"] = jsonRoute(`{"available":"2500000000000000000","hold":"0"}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		chk, _ := r.find("stake on hold")
+		if chk.state != "warn" || !strings.Contains(chk.detail, "2.5000") {
+			t.Errorf("stake check = %+v, want a warning naming the amount", chk)
+		}
+		if !strings.Contains(chk.fix, "--claim-stakes") {
+			t.Errorf("fix should name the claim command, got %q", chk.fix)
+		}
+	})
+
+	t.Run("rate-limited models are reported", func(t *testing.T) {
+		rpc := rpcServer(t, okRPC("0x2105"))
+		routes := healthyRoutes(rpc)
+		routes["GET /healthcheck"] = jsonRoute(`{"status":"healthy","version":"v7.14.0","uptime":"1h",
+			"components":{"badgerdb":"healthy"},
+			"models":[
+			  {"modelId":"0xaaa","status":"unhealthy","errorKind":"rate_limited","httpStatus":429},
+			  {"modelId":"0xbbb","status":"healthy"}]}`)
+		c, _ := newMockRouter(t, routes)
+		r := runChecks(c, config{})
+		chk, _ := r.find("model health")
+		if chk.state != "warn" || !strings.Contains(chk.detail, "rate-limited") {
+			t.Errorf("model health = %+v, want a rate-limit warning", chk)
+		}
+	})
+}
+
+func TestProbeRPC(t *testing.T) {
+	t.Run("reads the chain id", func(t *testing.T) {
+		var gotBody string
+		url := rpcServer(t, func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x2105"}`))
+		})
+		chain, status, err := probeRPC(url, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chain != "0x2105" || status != 200 {
+			t.Errorf("got chain=%q status=%d", chain, status)
+		}
+		if !strings.Contains(gotBody, "eth_chainId") {
+			t.Errorf("want an eth_chainId call, got %q", gotBody)
+		}
+	})
+
+	t.Run("reports the status for a throttled endpoint", func(t *testing.T) {
+		url := rpcServer(t, statusRoute(http.StatusTooManyRequests, `over rate limit`))
+		_, status, err := probeRPC(url, 5*time.Second)
+		if err == nil {
+			t.Fatal("want an error")
+		}
+		if status != 429 {
+			t.Errorf("status = %d, want 429 so the caller can distinguish it", status)
+		}
+	})
+
+	t.Run("surfaces a JSON-RPC error object", func(t *testing.T) {
+		url := rpcServer(t, jsonRoute(`{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}`))
+		_, _, err := probeRPC(url, 5*time.Second)
+		if err == nil || !strings.Contains(err.Error(), "limit exceeded") {
+			t.Errorf("want the RPC error surfaced, got %v", err)
 		}
 	})
 }

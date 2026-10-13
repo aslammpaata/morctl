@@ -71,6 +71,33 @@ GOOS=darwin GOARCH=arm64 go build -o morctl .
 ./morctl
 ```
 
+**Diagnose** — check everything a session needs, in dependency order:
+```bash
+./morctl --diagnose
+```
+```
+> diagnosing http://localhost:8082
+
+  ✔ router                 healthy, v7.14.0, up 53h43m52s
+  ✔ component badgerdb     healthy, size=256.0MB
+  ✔ credentials            accepted (wallet 0xffd9883a...)
+  ✔ chain id               8453 (Base)
+  ✔ rpc endpoints          7 configured
+  ✔ rpc reachable          https://mainnet.base.org (chain 0x2105)
+  ✔ balance                5.0000 MOR, 0.0004 ETH
+  ✔ allowance              14.4820 MOR approved for the Diamond
+  ✔ stake on hold          none
+  ✔ model health           1 model(s) reporting, none unhealthy
+
+  No blocking problems found.
+```
+Each line is `✔` pass, `⚠` worth knowing, or `✖` blocking — and every `✖`/`⚠`
+carries a suggested fix. Exit code is 1 if anything is blocking, so it works in a script.
+
+It **doesn't stop at the first problem**: a rejected cookie shouldn't hide a wrong chain
+ID. The router and model-health checks use the unauthenticated `/healthcheck`, so they
+still report usefully when credentials are broken.
+
 **List models** — see what's on the marketplace (narrow with `--model`):
 ```bash
 ./morctl --list-models
@@ -155,6 +182,7 @@ routers get a clear message saying so.
 | `--stakes` | off | Show MOR stake on hold for this wallet and exit |
 | `--claim-stakes` | off | Withdraw releasable stake (needs `--confirm`; sends a transaction) |
 | `--confirm` | off | Confirm an action that sends a transaction |
+| `--diagnose` | off | Check router, credentials, chain, RPC, funds and model health |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
 
 ### No default model
@@ -267,8 +295,9 @@ already running.
   typically the router's admin cookie). For shared/multi-user setups, create a scoped
   `open_session`+`chat` user via the router's `/auth/users` endpoint and pass those
   credentials instead.
-- Health-check is router-level only (`/healthcheck`); it does not check individual
-  model/provider health.
+- Per-model/provider health is reported by `--diagnose`, from the `models[]` block the
+  router has exposed on `/healthcheck` since v7.5.0. It reflects the provider's own
+  self-report, not an independent probe by `morctl`.
 
 ## Roadmap
 
