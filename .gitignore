@@ -1,0 +1,11 @@
+# Build output (binaries ship via release builds, not git)
+/morctl
+/morctl.exe
+/dist/
+
+# Local session cache. Holds a session id and, since the history change,
+# the conversation transcript -- never commit it.
+.morctl-session.json
+
+# Router API credentials. Never commit.
+.cookie

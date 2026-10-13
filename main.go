@@ -239,8 +239,8 @@ func run(cfg config) error {
 	if err := c.reachable(); err != nil {
 		fmt.Println("✖ router not reachable")
 		fmt.Println("  Start Morpheus first, then re-run:")
-		fmt.Println("   - Installer build: open the app from the Start-menu/desktop shortcut (router auto-starts)")
-		fmt.Println("   - Archive build:   run  mor-launch.exe  in the extracted folder")
+		fmt.Println("   - Desktop App: open it from the Start-menu/desktop shortcut (the router auto-starts)")
+		fmt.Println("   - Headless:    run the proxy-router binary with your .env")
 		return fmt.Errorf("router unreachable at %s (%v)", c.base, err)
 	}
 	fmt.Println("✔ router reachable")

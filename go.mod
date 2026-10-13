@@ -1,3 +1,3 @@
-module github.com/aslamwaiswa/morpheus-doctor
+module github.com/aslammpaata/morctl
 
 go 1.21
