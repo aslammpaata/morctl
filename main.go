@@ -56,6 +56,7 @@ type config struct {
 	claimStakes  bool
 	confirm      bool
 	diagnose     bool
+	noStream     bool
 	cacheFile    string
 }
 
@@ -88,6 +89,7 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.claimStakes, "claim-stakes", false, "withdraw releasable stake (requires --confirm; sends a transaction)")
 	flag.BoolVar(&cfg.confirm, "confirm", false, "confirm an action that sends a transaction")
 	flag.BoolVar(&cfg.diagnose, "diagnose", false, "check router, credentials, chain, RPC, funds and model health, then exit")
+	flag.BoolVar(&cfg.noStream, "no-stream", false, "in --interactive, wait for the whole reply instead of streaming it")
 	flag.Parse()
 	cfg.timeout = 60 * time.Second
 	cfg.cacheFile = sessionCacheFile
@@ -1459,38 +1461,153 @@ func devFlow(c *client, cfg config) error {
 	return nil
 }
 
-// interactiveLoop sends repeated prompts against the same session, maintaining
-// the full message history client-side and resending it each turn (OpenAI-style
-// chat semantics) -- the router does not retain conversation state on its own.
-func interactiveLoop(c *client, cfg config, sessionID string, exp time.Time, history []message) error {
-	fmt.Printf("\n> session live. Type a message and press Enter (type 'exit' to end early).\n\n")
-	scanner := bufio.NewScanner(os.Stdin)
+// chatUI is one interactive run against an already-open session. It keeps the
+// transcript client-side and resends it every turn (OpenAI-style chat
+// semantics), because the router retains no conversation state of its own.
+//
+// It stays stdlib-only on purpose. Streaming, a status line and slash commands
+// need no TUI framework, and mor-cli's chat bugs -- an error assigned to a
+// value-receiver copy and so never rendered, then a permanent block on an
+// unbuffered channel -- come precisely from that framework's event loop.
+type chatUI struct {
+	c   *client
+	cfg config
+	out io.Writer
 
-	// persist mirrors the in-memory history to the cache after every turn, so
-	// an interrupted run loses at most the turn in flight.
-	persist := func() {
-		if cfg.noHistory {
-			return
+	id      string    // session id
+	exp     time.Time // session expiry
+	escrow  string    // escrowed stake in wei; "" when unknown
+	history []message
+	tty     bool // interactive terminal: show prompts, status line and streaming
+}
+
+// interactiveLoop is the entry point kept for devFlow and the tests.
+func interactiveLoop(c *client, cfg config, sessionID string, exp time.Time, history []message) error {
+	ui := &chatUI{
+		c:       c,
+		cfg:     cfg,
+		out:     os.Stdout,
+		id:      sessionID,
+		exp:     exp,
+		history: history,
+		tty:     isTerminal(os.Stdin),
+	}
+	// The escrowed stake never changes while a session is open, so look it up
+	// once. A failure here only costs a field in the status line.
+	if s, err := c.session(sessionID); err == nil {
+		ui.escrow = s.Stake.String()
+	}
+	return ui.run()
+}
+
+const chatHelp = `  commands:
+    /help              show this
+    /history           print the conversation so far
+    /new               start a new conversation on the SAME session (no new stake)
+    /model             show the model, session and time remaining
+    /exit, /quit       leave the chat (the session stays open on-chain)`
+
+// statusLine is redrawn before each prompt so the two facts that cost money --
+// how long is left, and how much is escrowed -- are never more than one line
+// away.
+func (u *chatUI) statusLine() string {
+	parts := []string{u.cfg.model, remaining(u.exp) + " left"}
+	if u.escrow != "" {
+		parts = append(parts, formatWei(u.escrow)+" MOR escrowed")
+	}
+	if n := len(u.history); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d msg", n))
+	}
+	return "[" + strings.Join(parts, " · ") + "]"
+}
+
+// persist mirrors the transcript to the cache after every completed turn, so an
+// interrupted run loses at most the turn in flight.
+func (u *chatUI) persist() {
+	if u.cfg.noHistory {
+		return
+	}
+	cached, ok := loadSessionCache(u.cfg.cacheFile)
+	if !ok || cached.SessionID != u.id {
+		// The cache was replaced or removed underneath us; rebuild the record
+		// rather than writing history against the wrong session.
+		cached = sessionCache{
+			SessionID: u.id,
+			ModelID:   u.cfg.modelID,
+			Model:     u.cfg.model,
+			OpenedAt:  time.Now().Unix(),
+			Duration:  u.cfg.duration,
+			ExpiresAt: u.exp.Unix(),
 		}
-		cached, ok := loadSessionCache(cfg.cacheFile)
-		if !ok || cached.SessionID != sessionID {
-			// The cache was replaced or removed underneath us; rebuild the
-			// record rather than writing history against the wrong session.
-			cached = sessionCache{
-				SessionID: sessionID,
-				ModelID:   cfg.modelID,
-				Model:     cfg.model,
-				OpenedAt:  time.Now().Unix(),
-				Duration:  cfg.duration,
-				ExpiresAt: exp.Unix(),
-			}
-		}
-		cached.History = history
-		saveSessionCache(cfg.cacheFile, cached)
+	}
+	cached.History = u.history
+	saveSessionCache(u.cfg.cacheFile, cached)
+}
+
+type loopAction int
+
+const (
+	actionSend     loopAction = iota // ordinary input: send it to the model
+	actionContinue                   // handled locally: prompt again
+	actionExit                       // leave the loop
+)
+
+// command handles the non-prompt inputs. Anything starting with "/" is handled
+// here and never sent to the model, so a mistyped command costs no tokens.
+func (u *chatUI) command(line string) loopAction {
+	switch {
+	case line == "exit", line == "quit", line == "/exit", line == "/quit":
+		return actionExit
+	case !strings.HasPrefix(line, "/"):
+		return actionSend
 	}
 
+	switch strings.Fields(line)[0] {
+	case "/help", "/?":
+		fmt.Fprintln(u.out, chatHelp)
+	case "/history":
+		if len(u.history) == 0 {
+			fmt.Fprintln(u.out, "  (no messages yet)")
+			break
+		}
+		for _, m := range u.history {
+			who := "you"
+			if m.Role == "assistant" {
+				who = "model"
+			}
+			fmt.Fprintf(u.out, "  %-5s %s\n", who, m.Content)
+		}
+	case "/new":
+		u.history = nil
+		u.persist()
+		fmt.Fprintln(u.out, "  conversation cleared. Same session, so no new stake was taken.")
+	case "/model":
+		fmt.Fprintf(u.out, "  model:   %s\n     id:   %s\n", u.cfg.model, u.cfg.modelID)
+		fmt.Fprintf(u.out, "  session: %s (%s remaining)\n", u.id, remaining(u.exp))
+		if u.escrow != "" {
+			fmt.Fprintf(u.out, "  staked:  %s MOR\n", formatWei(u.escrow))
+		}
+		fmt.Fprintln(u.out, "  Switching model needs a new session, which stakes MOR:")
+		fmt.Fprintln(u.out, "  leave, then re-run with --model-id for the other model.")
+	default:
+		fmt.Fprintf(u.out, "  unknown command %q -- /help lists them. Nothing was sent.\n",
+			strings.Fields(line)[0])
+	}
+	return actionContinue
+}
+
+func (u *chatUI) run() error {
+	if u.tty {
+		fmt.Fprintf(u.out, "\n> session live. Type a message, or /help for commands.\n")
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
 	for {
-		fmt.Print("you> ")
+		if u.tty {
+			fmt.Fprintf(u.out, "\n%s\n", u.statusLine())
+			fmt.Fprint(u.out, "you> ")
+		}
 		if !scanner.Scan() {
 			break
 		}
@@ -1498,22 +1615,90 @@ func interactiveLoop(c *client, cfg config, sessionID string, exp time.Time, his
 		if line == "" {
 			continue
 		}
-		if line == "exit" || line == "quit" {
-			break
-		}
-		history = append(history, message{Role: "user", Content: line})
-		reply, err := c.chat(sessionID, cfg.model, cfg.modelID, history)
-		if err != nil {
-			renderError(os.Stderr, err, cfg)
-			history = history[:len(history)-1] // don't poison history with a failed turn
+		switch u.command(line) {
+		case actionExit:
+			u.farewell()
+			return nil
+		case actionContinue:
 			continue
 		}
-		history = append(history, message{Role: "assistant", Content: reply})
-		persist()
-		fmt.Printf("model> %s\n\n", reply)
+
+		u.history = append(u.history, message{Role: "user", Content: line})
+		reply, err := u.send(line)
+		if err != nil {
+			renderError(os.Stderr, err, u.cfg)
+			u.history = u.history[:len(u.history)-1] // don't poison history with a failed turn
+			continue
+		}
+		u.history = append(u.history, message{Role: "assistant", Content: reply})
+		u.persist()
 	}
-	fmt.Printf("✅ session %s ended locally (stake refunds automatically at natural expiry; cached for reuse until then)\n", short(sessionID))
+	u.farewell()
 	return nil
+}
+
+// send runs one turn, streaming the reply to the terminal as it arrives.
+// Non-interactive output is printed whole, so piped output stays clean.
+func (u *chatUI) send(line string) (string, error) {
+	if u.cfg.noStream {
+		reply, err := u.c.chat(u.id, u.cfg.model, u.cfg.modelID, u.history)
+		if err != nil {
+			return "", err
+		}
+		u.printReply(reply)
+		return reply, nil
+	}
+
+	streaming := false
+	onChunk := func(delta string) {
+		if !u.tty {
+			return // piped output is printed whole, below
+		}
+		if !streaming {
+			fmt.Fprint(u.out, "model> ")
+			streaming = true
+		}
+		fmt.Fprint(u.out, delta)
+	}
+	reply, err := u.c.chatStream(u.id, u.cfg.model, u.cfg.modelID, u.history, onChunk)
+	if streaming {
+		fmt.Fprintln(u.out)
+	}
+	if err != nil {
+		return "", err
+	}
+	if !streaming {
+		u.printReply(reply)
+	}
+	return reply, nil
+}
+
+func (u *chatUI) printReply(reply string) {
+	if u.tty {
+		fmt.Fprintf(u.out, "model> %s\n", reply)
+		return
+	}
+	fmt.Fprintln(u.out, reply)
+}
+
+// farewell is deliberately explicit about what did and did not happen: leaving
+// the chat is a local act, and the session remains open and paid for. Saying
+// "session closed" here would be both wrong and expensive to believe.
+func (u *chatUI) farewell() {
+	if !u.tty {
+		return
+	}
+	fmt.Fprintf(u.out, "\n✅ left the chat. The session is still OPEN on-chain.\n")
+	fmt.Fprintf(u.out, "   session: %s (%s remaining)\n", short(u.id), remaining(u.exp))
+	if u.escrow != "" {
+		fmt.Fprintf(u.out, "   %s MOR stays escrowed and returns automatically at natural expiry.\n", formatWei(u.escrow))
+	} else {
+		fmt.Fprintf(u.out, "   The stake returns automatically at natural expiry.\n")
+	}
+	fmt.Fprintf(u.out, "   Nothing was closed early, so there is no 24h on-hold penalty.\n")
+	if !u.cfg.noHistory {
+		fmt.Fprintf(u.out, "   Re-run the same command to resume this session and conversation.\n")
+	}
 }
 
 // chat sends the full message history against an already-open session and
@@ -1534,6 +1719,152 @@ func (c *client) chat(sessionID, model, modelID string, messages []message) (str
 		return "", errors.New("empty response")
 	}
 	return strings.TrimSpace(chat.Choices[0].Message.Content), nil
+}
+
+// session fetches one on-chain session, used for the escrowed stake shown in
+// the interactive status line.
+func (c *client) session(id string) (sessionListItem, error) {
+	var resp struct {
+		Session sessionListItem `json:"session"`
+	}
+	err := c.do(http.MethodGet, "/blockchain/sessions/"+id, nil, nil, &resp)
+	return resp.Session, err
+}
+
+// streamHTTPClient is used for streamed completions. A long generation can
+// outlast the ordinary request timeout, so there is no overall deadline; a
+// stalled connection is caught by the response-header and idle timeouts
+// instead, so a dead provider still fails rather than hanging forever.
+func streamHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 60 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
+	}
+}
+
+// chatStream sends the transcript with stream:true and hands each incremental
+// delta to onChunk as it arrives, returning the assembled reply.
+//
+// Two things here are deliberate, both being the bugs that make mor-cli's TUI
+// appear to do nothing (see the review in the plan): the response status is
+// checked before the body is read, and a body that is not SSE is decoded as an
+// ordinary completion rather than silently yielding an empty answer.
+func (c *client) chatStream(sessionID, model, modelID string, messages []message, onChunk func(string)) (string, error) {
+	body, err := json.Marshal(map[string]any{
+		"model":    model,
+		"messages": messages,
+		"stream":   true,
+	})
+	if err != nil {
+		return "", err
+	}
+	const path = "/v1/chat/completions"
+	req, err := http.NewRequest(http.MethodPost, c.base+path, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.SetBasicAuth(c.user, c.pass)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("session_id", sessionID)
+	req.Header.Set("model_id", modelID)
+
+	resp, err := streamHTTPClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Check the status first. Without this, a 4xx/5xx body is simply not SSE,
+	// no chunks ever arrive, and the caller waits forever on a reply that was
+	// refused -- which is exactly what mor-cli does.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return "", &routerError{
+			method: http.MethodPost,
+			path:   path,
+			status: resp.StatusCode,
+			reason: resp.Status,
+			body:   snippet(data),
+		}
+	}
+
+	var full strings.Builder
+	var raw bytes.Buffer
+	scanner := bufio.NewScanner(resp.Body)
+	// Allow for long single-line SSE frames rather than erroring on them.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	sawFrame := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if raw.Len() < 4096 {
+			raw.WriteString(line)
+			raw.WriteByte('\n')
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			if payload == "[DONE]" {
+				sawFrame = true
+				break
+			}
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			// A frame we cannot read is not worth aborting a live answer for.
+			continue
+		}
+		sawFrame = true
+		for _, ch := range chunk.Choices {
+			// Some providers emit the sentinel as content rather than a frame.
+			if ch.Delta.Content == "" || ch.Delta.Content == "[DONE]" {
+				continue
+			}
+			full.WriteString(ch.Delta.Content)
+			if onChunk != nil {
+				onChunk(ch.Delta.Content)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if full.Len() > 0 {
+			// Keep a partial answer rather than throwing it away.
+			return strings.TrimSpace(full.String()), fmt.Errorf("stream interrupted after a partial reply: %w", err)
+		}
+		return "", fmt.Errorf("reading stream: %w", err)
+	}
+
+	// Not SSE after all: some providers answer stream:true with a plain
+	// completion. Decode it instead of reporting an empty reply.
+	if !sawFrame {
+		var plain chatResp
+		if err := json.Unmarshal(raw.Bytes(), &plain); err == nil && len(plain.Choices) > 0 {
+			text := strings.TrimSpace(plain.Choices[0].Message.Content)
+			if onChunk != nil && text != "" {
+				onChunk(text)
+			}
+			return text, nil
+		}
+		return "", errors.New("the router returned no usable completion")
+	}
+
+	text := strings.TrimSpace(full.String())
+	if text == "" {
+		return "", errors.New("empty response")
+	}
+	return text, nil
 }
 
 func snippet(b []byte) string {

@@ -91,6 +91,53 @@ Consequences worth being explicit about:
   leaves stored history untouched — so scripted runs remain
   reproducible. `--interactive` is the conversational mode.
 
+## Interactive mode
+
+`--interactive` streams replies, shows a status line and takes slash
+commands, and it does all of that with the standard library only.
+
+**Why no TUI framework.** Streaming, a one-line status bar and slash
+commands need `bufio` and `fmt`, nothing more. Adding bubbletea would
+pull roughly twenty modules into a zero-dependency tool for the one
+dimension where competing with `mor-cli` has least value — and
+`mor-cli`'s chat bugs come precisely from that event loop: an error
+assigned to a value-receiver copy and therefore never rendered, followed
+by a permanent block on an unbuffered channel. The cost of the framework
+there was correctness, not just size.
+
+**Streaming** is a separate client path from the one-shot `chat`, and it
+does two things `mor-cli`'s streaming does not:
+
+- It checks the response status *before* reading the body. Without that,
+  a 401 or 429 body is simply not SSE, no frames arrive, no error is
+  raised, and the UI waits forever on an answer that was refused.
+- It falls back to decoding an ordinary completion when the body turns
+  out not to be SSE, because some providers ignore `stream:true`.
+  Reporting an empty reply there would look like the model said nothing.
+
+It also passes *deltas* to the caller rather than the accumulated text,
+and treats a `[DONE]` payload as a terminator rather than content.
+
+**The status line** is redrawn before each prompt and carries the two
+facts that cost money: time remaining and escrowed stake (read once from
+`GET /blockchain/sessions/{id}`, since it cannot change while the session
+is open).
+
+**Slash commands** are handled locally and never sent to the model, so a
+mistyped command costs no tokens. `/new` clears the conversation but
+keeps the session, and says so — a user must not fear that starting a
+new conversation stakes more MOR. `/model` deliberately only *shows* the
+model: switching needs a new session, which stakes MOR, so it tells the
+user to leave and re-run rather than doing it silently.
+
+**Leaving is explicit.** The farewell states that the session is still
+open, how long is left, how much is escrowed, and that nothing was closed
+early so there is no 24h on-hold penalty. "Session closed" would be both
+wrong and expensive for a user to believe.
+
+**Non-TTY runs** (piped stdin, CI) suppress the prompt, status line and
+farewell and print replies plain, so the output is only the answers.
+
 ## Config & secrets
 
 - Router API auth: `.cookie` file (`admin:<random>`, default `./.cookie`;

@@ -120,8 +120,40 @@ history resent each turn (the router does not retain context on its own — see
 ```bash
 ./morctl --dev --interactive --model-id 0xbb9e920d...
 ```
-Type `exit` or `quit` to end. The session's stake refunds automatically at its natural
-expiry — exiting the loop does not close it early.
+```
+> session live. Type a message, or /help for commands.
+
+[kimi-k2.5 · 9m35s left · 5.0000 MOR escrowed · 6 msg]
+you> what is 2+2?
+model> 4
+```
+Replies **stream** as they are generated (`--no-stream` waits for the whole reply). The
+status line above each prompt keeps the two facts that cost money — time left and stake
+escrowed — one line away.
+
+| Command | |
+|---|---|
+| `/help` | list the commands |
+| `/history` | print the conversation so far |
+| `/new` | start a new conversation on the **same** session (no new stake) |
+| `/model` | show the model, session and time remaining |
+| `/exit`, `/quit` | leave the chat (`exit`/`quit` also work) |
+
+An unrecognised `/command` is reported and **not** sent to the model, so a typo costs no
+tokens.
+
+Leaving the chat is a **local** act: the session stays open on-chain and its stake returns
+automatically at natural expiry, so there is no 24-hour on-hold penalty. Re-running the
+same command resumes both the session and the conversation.
+
+**Piped input works too** (non-TTY), with the prompts, status line and banner suppressed
+so the output is just the replies:
+```bash
+printf 'first question
+second question
+/exit
+' | ./morctl --dev --interactive --model-id 0x...
+```
 
 **Sessions** — list this wallet's recent sessions so overlapping ones are legible:
 ```bash
@@ -183,6 +215,7 @@ routers get a clear message saying so.
 | `--claim-stakes` | off | Withdraw releasable stake (needs `--confirm`; sends a transaction) |
 | `--confirm` | off | Confirm an action that sends a transaction |
 | `--diagnose` | off | Check router, credentials, chain, RPC, funds and model health |
+| `--no-stream` | off | In `--interactive`, wait for the whole reply instead of streaming |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
 
 ### No default model
@@ -278,10 +311,11 @@ already running.
   with only the latest message will not have any memory of earlier turns. (This is
   confirmed intended behavior, not a bug — the client is responsible for turn/history
   management.)
-- **Session close vs. session end.** Typing `exit` in `--interactive` stops the local
-  loop only; it does not close the session on-chain. Your stake returns automatically
-  ~1 minute after the session's natural expiry, same as any Morpheus session. This
-  avoids the early-close on-hold penalty.
+- **Session close vs. session end.** Typing `exit` (or `/exit`) in `--interactive` stops
+  the local loop only; it does not close the session on-chain, and the tool says so
+  explicitly on the way out. Your stake returns automatically ~1 minute after the
+  session's natural expiry, same as any Morpheus session. This avoids the early-close
+  on-hold penalty — see [`--stakes`](#usage) for stake that *is* on hold.
 
 ## Known limitations / status
 

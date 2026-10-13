@@ -951,6 +951,460 @@ func TestInteractiveLoopPersistsHistory(t *testing.T) {
 	})
 }
 
+// --- streaming --------------------------------------------------------------
+
+// sseRoute serves the given lines as an event stream.
+func sseRoute(lines ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, l := range lines {
+			_, _ = w.Write([]byte(l + "\n"))
+		}
+	}
+}
+
+func deltaFrame(content string) string {
+	b, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{{"delta": map[string]string{"content": content}}},
+	})
+	return "data: " + string(b)
+}
+
+func TestChatStream(t *testing.T) {
+	t.Run("assembles deltas and reports them incrementally", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": sseRoute(
+				deltaFrame("Hello"), "", deltaFrame(", "), deltaFrame("world!"), "data: [DONE]",
+			),
+		})
+		var chunks []string
+		reply, err := c.chatStream("0xsess", "m", "0xmodel",
+			[]message{{Role: "user", Content: "hi"}},
+			func(d string) { chunks = append(chunks, d) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply != "Hello, world!" {
+			t.Errorf("reply = %q, want %q", reply, "Hello, world!")
+		}
+		// Deltas, not a growing accumulation: mor-cli re-sends the whole
+		// accumulated string each time, which double-prints the answer.
+		want := []string{"Hello", ", ", "world!"}
+		if len(chunks) != len(want) {
+			t.Fatalf("got %d chunks %q, want %d", len(chunks), chunks, len(want))
+		}
+		for i := range want {
+			if chunks[i] != want[i] {
+				t.Errorf("chunk %d = %q, want %q", i, chunks[i], want[i])
+			}
+		}
+	})
+
+	t.Run("sets the session and model headers and asks for a stream", func(t *testing.T) {
+		var sess, modelID string
+		var streamed bool
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+				sess = r.Header.Get("session_id")
+				modelID = r.Header.Get("model_id")
+				var body struct {
+					Stream bool `json:"stream"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				streamed = body.Stream
+				sseRoute(deltaFrame("ok"), "data: [DONE]")(w, r)
+			},
+		})
+		if _, err := c.chatStream("0xsess", "m", "0xmodel", []message{{Role: "user", Content: "hi"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if sess != "0xsess" || modelID != "0xmodel" || !streamed {
+			t.Errorf("session=%q model=%q stream=%v", sess, modelID, streamed)
+		}
+	})
+
+	// This is the mor-cli bug the design calls out: it never checks the status,
+	// so a refused request yields no frames, no error, and a UI that hangs.
+	t.Run("a non-2xx response is an error, not a silent hang", func(t *testing.T) {
+		for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusInternalServerError} {
+			c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+				"POST /v1/chat/completions": statusRoute(status, `{"error":"over rate limit"}`),
+			})
+			called := false
+			_, err := c.chatStream("0xsess", "m", "0xmodel",
+				[]message{{Role: "user", Content: "hi"}},
+				func(string) { called = true })
+			if err == nil {
+				t.Fatalf("status %d: want an error", status)
+			}
+			var re *routerError
+			if !errors.As(err, &re) {
+				t.Fatalf("status %d: want a *routerError for translation, got %T", status, err)
+			}
+			if re.status != status {
+				t.Errorf("got status %d, want %d", re.status, status)
+			}
+			if called {
+				t.Errorf("status %d: no chunk should be emitted for a refused request", status)
+			}
+		}
+	})
+
+	t.Run("a plain completion answering stream:true still works", func(t *testing.T) {
+		// Some providers ignore stream:true. Falling through to an empty reply
+		// would look like the model said nothing.
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": jsonRoute(
+				`{"choices":[{"message":{"role":"assistant","content":" plain answer "}}]}`),
+		})
+		var got string
+		reply, err := c.chatStream("0xsess", "m", "0xmodel",
+			[]message{{Role: "user", Content: "hi"}}, func(d string) { got += d })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply != "plain answer" {
+			t.Errorf("reply = %q", reply)
+		}
+		if got != "plain answer" {
+			t.Errorf("the fallback should still emit the text, got %q", got)
+		}
+	})
+
+	t.Run("the DONE sentinel is not treated as content", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": sseRoute(
+				deltaFrame("answer"), deltaFrame("[DONE]"), "data: [DONE]"),
+		})
+		reply, err := c.chatStream("0xsess", "m", "0xmodel", []message{{Role: "user", Content: "hi"}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply != "answer" {
+			t.Errorf("reply = %q, want the sentinel excluded", reply)
+		}
+	})
+
+	t.Run("an unreadable frame does not abort a live answer", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": sseRoute(
+				deltaFrame("good "), "data: {not json", deltaFrame("parts"), "data: [DONE]"),
+		})
+		reply, err := c.chatStream("0xsess", "m", "0xmodel", []message{{Role: "user", Content: "hi"}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply != "good parts" {
+			t.Errorf("reply = %q, want the readable frames kept", reply)
+		}
+	})
+
+	t.Run("a body with no usable completion is an error", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": jsonRoute(`{"unexpected":"shape"}`),
+		})
+		if _, err := c.chatStream("0xsess", "m", "0xmodel", []message{{Role: "user", Content: "hi"}}, nil); err == nil {
+			t.Fatal("want an error rather than a silent empty reply")
+		}
+	})
+}
+
+// --- interactive UI ---------------------------------------------------------
+
+// newTestUI builds a chatUI writing to a buffer, as if on a terminal.
+func newTestUI(t *testing.T, c *client, cfg config) (*chatUI, *strings.Builder) {
+	t.Helper()
+	var buf strings.Builder
+	if cfg.cacheFile == "" {
+		cfg.cacheFile = tempCache(t)
+	}
+	return &chatUI{
+		c:       c,
+		cfg:     cfg,
+		out:     &buf,
+		id:      "0xlive",
+		exp:     time.Now().Add(10 * time.Minute),
+		escrow:  "5000000000000000000",
+		tty:     true,
+		history: nil,
+	}, &buf
+}
+
+func TestStatusLine(t *testing.T) {
+	ui, _ := newTestUI(t, nil, config{model: "kimi-k2.5"})
+	line := ui.statusLine()
+	for _, want := range []string{"kimi-k2.5", "left", "5.0000 MOR escrowed"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("status line %q should contain %q", line, want)
+		}
+	}
+
+	t.Run("escrow is omitted when unknown", func(t *testing.T) {
+		ui, _ := newTestUI(t, nil, config{model: "m"})
+		ui.escrow = ""
+		if strings.Contains(ui.statusLine(), "escrowed") {
+			t.Errorf("status line should omit an unknown escrow: %q", ui.statusLine())
+		}
+	})
+
+	t.Run("message count appears once there is history", func(t *testing.T) {
+		ui, _ := newTestUI(t, nil, config{model: "m"})
+		ui.history = []message{{Role: "user", Content: "a"}, {Role: "assistant", Content: "b"}}
+		if !strings.Contains(ui.statusLine(), "2 msg") {
+			t.Errorf("status line = %q, want a message count", ui.statusLine())
+		}
+	})
+}
+
+func TestSlashCommands(t *testing.T) {
+	t.Run("exit forms leave the loop", func(t *testing.T) {
+		for _, in := range []string{"exit", "quit", "/exit", "/quit"} {
+			ui, _ := newTestUI(t, nil, config{})
+			if got := ui.command(in); got != actionExit {
+				t.Errorf("command(%q) = %v, want actionExit", in, got)
+			}
+		}
+	})
+
+	t.Run("ordinary text is sent", func(t *testing.T) {
+		ui, _ := newTestUI(t, nil, config{})
+		if got := ui.command("what is 2+2?"); got != actionSend {
+			t.Errorf("command() = %v, want actionSend", got)
+		}
+	})
+
+	t.Run("/help lists the commands", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{})
+		if got := ui.command("/help"); got != actionContinue {
+			t.Errorf("command() = %v, want actionContinue", got)
+		}
+		for _, want := range []string{"/history", "/new", "/model", "/exit"} {
+			if !strings.Contains(buf.String(), want) {
+				t.Errorf("/help output should mention %q, got:\n%s", want, buf.String())
+			}
+		}
+	})
+
+	t.Run("/history prints the transcript", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{})
+		ui.history = []message{
+			{Role: "user", Content: "my name is Sam"},
+			{Role: "assistant", Content: "hello Sam"},
+		}
+		ui.command("/history")
+		out := buf.String()
+		if !strings.Contains(out, "my name is Sam") || !strings.Contains(out, "hello Sam") {
+			t.Errorf("/history should print both turns, got:\n%s", out)
+		}
+	})
+
+	t.Run("/history on an empty conversation says so", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{})
+		ui.command("/history")
+		if !strings.Contains(buf.String(), "no messages") {
+			t.Errorf("want an empty-state message, got:\n%s", buf.String())
+		}
+	})
+
+	t.Run("/new clears history, persists, and promises no new stake", func(t *testing.T) {
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: "0xlive", ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+			History: []message{{Role: "user", Content: "old talk"}},
+		})
+		ui, buf := newTestUI(t, nil, config{cacheFile: path})
+		ui.history = []message{{Role: "user", Content: "old talk"}}
+		ui.command("/new")
+		if len(ui.history) != 0 {
+			t.Errorf("history should be cleared, got %+v", ui.history)
+		}
+		cached, _ := loadSessionCache(path)
+		if len(cached.History) != 0 {
+			t.Errorf("the cleared history must be persisted, got %+v", cached.History)
+		}
+		if cached.SessionID != "0xlive" {
+			t.Errorf("/new must not discard the session, got %q", cached.SessionID)
+		}
+		// The wording matters: a user must not fear /new costs MOR.
+		if !strings.Contains(buf.String(), "no new stake") {
+			t.Errorf("/new should say no stake was taken, got:\n%s", buf.String())
+		}
+	})
+
+	t.Run("/model shows the session and explains switching", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{model: "kimi-k2.5", modelID: "0xmodelid"})
+		ui.command("/model")
+		out := buf.String()
+		for _, want := range []string{"kimi-k2.5", "0xmodelid", "0xlive", "--model-id"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("/model output should contain %q, got:\n%s", want, out)
+			}
+		}
+		if !strings.Contains(out, "stakes MOR") {
+			t.Errorf("/model should warn that switching stakes MOR, got:\n%s", out)
+		}
+	})
+
+	t.Run("an unknown command is not sent to the model", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{})
+		if got := ui.command("/bogus"); got != actionContinue {
+			t.Errorf("command() = %v, want actionContinue so nothing is sent", got)
+		}
+		if !strings.Contains(buf.String(), "Nothing was sent") {
+			t.Errorf("want a clear no-op message, got:\n%s", buf.String())
+		}
+	})
+}
+
+func TestInteractiveStreamingAndFarewell(t *testing.T) {
+	t.Run("a streamed turn is printed as it arrives and stored whole", func(t *testing.T) {
+		path := tempCache(t)
+		saveSessionCache(path, sessionCache{
+			SessionID: "0xlive", ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+			Duration: 600, ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
+		})
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": sseRoute(
+				deltaFrame("four"), deltaFrame("teen"), "data: [DONE]"),
+		})
+		ui, buf := newTestUI(t, c, config{model: "m", modelID: "0xmodel", cacheFile: path})
+		ui.history = []message{{Role: "user", Content: "q"}}
+		reply, err := ui.send("q")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply != "fourteen" {
+			t.Errorf("reply = %q", reply)
+		}
+		if !strings.Contains(buf.String(), "model> fourteen") {
+			t.Errorf("want the streamed reply under a model> prefix, got:\n%q", buf.String())
+		}
+	})
+
+	t.Run("--no-stream takes the whole-reply path", func(t *testing.T) {
+		streamed := false
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Stream bool `json:"stream"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				streamed = body.Stream
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"whole"}}]}`))
+			},
+		})
+		ui, buf := newTestUI(t, c, config{model: "m", modelID: "0xmodel", noStream: true})
+		reply, err := ui.send("q")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if streamed {
+			t.Error("--no-stream must not request a stream")
+		}
+		if reply != "whole" || !strings.Contains(buf.String(), "model> whole") {
+			t.Errorf("reply = %q, out = %q", reply, buf.String())
+		}
+	})
+
+	t.Run("non-TTY output is plain and unprompted", func(t *testing.T) {
+		c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+			"POST /v1/chat/completions": sseRoute(deltaFrame("piped reply"), "data: [DONE]"),
+		})
+		ui, buf := newTestUI(t, c, config{model: "m", modelID: "0xmodel"})
+		ui.tty = false
+		if _, err := ui.send("q"); err != nil {
+			t.Fatal(err)
+		}
+		out := buf.String()
+		if strings.Contains(out, "model>") {
+			t.Errorf("piped output should carry no prompt decoration, got %q", out)
+		}
+		if strings.TrimSpace(out) != "piped reply" {
+			t.Errorf("piped output = %q, want just the reply", out)
+		}
+	})
+
+	t.Run("the farewell never claims the session was closed", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{})
+		ui.farewell()
+		out := buf.String()
+		if !strings.Contains(out, "still OPEN") {
+			t.Errorf("farewell must say the session stays open, got:\n%s", out)
+		}
+		if !strings.Contains(out, "no 24h on-hold penalty") {
+			t.Errorf("farewell should explain why nothing was closed early, got:\n%s", out)
+		}
+		if !strings.Contains(out, "5.0000 MOR") {
+			t.Errorf("farewell should name the escrowed stake, got:\n%s", out)
+		}
+		// The wording that would cost a user money if believed.
+		if strings.Contains(strings.ToLower(out), "session closed") {
+			t.Errorf("farewell must not say the session was closed, got:\n%s", out)
+		}
+	})
+
+	t.Run("the farewell is silent when piped", func(t *testing.T) {
+		ui, buf := newTestUI(t, nil, config{})
+		ui.tty = false
+		ui.farewell()
+		if buf.String() != "" {
+			t.Errorf("piped runs should get no farewell banner, got %q", buf.String())
+		}
+	})
+}
+
+// TestInteractiveLoopEndToEnd drives the whole loop over scripted stdin,
+// mixing commands with real turns.
+func TestInteractiveLoopEndToEnd(t *testing.T) {
+	path := tempCache(t)
+	exp := time.Now().Add(10 * time.Minute)
+	saveSessionCache(path, sessionCache{
+		SessionID: "0xlive", ModelID: "0xmodel", OpenedAt: time.Now().Unix(),
+		Duration: 600, ExpiresAt: exp.Unix(),
+	})
+	turns := 0
+	c, _ := newMockRouter(t, map[string]http.HandlerFunc{
+		"GET /blockchain/sessions/0xlive": jsonRoute(
+			`{"session":{"Id":"0xlive","Stake":5000000000000000000,"EndsAt":` +
+				strconv.FormatInt(exp.Unix(), 10) + `}}`),
+		"POST /v1/chat/completions": func(w http.ResponseWriter, r *http.Request) {
+			turns++
+			sseRoute(deltaFrame("reply "+strconv.Itoa(turns)), "data: [DONE]")(w, r)
+		},
+	})
+
+	withStdin(t, strings.Join([]string{
+		"/help",      // handled locally
+		"first",      // a real turn
+		"/bogus",     // ignored, not sent
+		"second",     // a real turn
+		"/new",       // clears history
+		"third",      // a real turn, with no prior context
+		"/exit",      // leaves
+		"never read", // must not be consumed
+	}, "\n")+"\n")
+
+	cfg := config{model: "m", modelID: "0xmodel", duration: 600, cacheFile: path}
+	if err := interactiveLoop(c, cfg, "0xlive", exp, nil); err != nil {
+		t.Fatal(err)
+	}
+	if turns != 3 {
+		t.Errorf("got %d inference calls, want 3 (commands must not be sent)", turns)
+	}
+	cached, _ := loadSessionCache(path)
+	// /new cleared the first two turns, so only the third exchange remains.
+	if len(cached.History) != 2 {
+		t.Fatalf("want 2 messages after /new plus one turn, got %d: %+v", len(cached.History), cached.History)
+	}
+	if cached.History[0].Content != "third" {
+		t.Errorf("history should start after /new, got %+v", cached.History)
+	}
+	if cached.SessionID != "0xlive" {
+		t.Errorf("the session record must survive, got %q", cached.SessionID)
+	}
+}
+
 // TestChatSendsSessionHeaders checks the wire contract the router relies on.
 func TestChatSendsSessionHeaders(t *testing.T) {
 	var gotSession, gotModelID string
