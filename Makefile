@@ -1,7 +1,7 @@
 BINARY = morctl
 DIST   = dist
 
-.PHONY: all build test vet check build-all clean
+.PHONY: all build test vet check build-all live-test clean
 
 all: build
 
@@ -25,6 +25,11 @@ build-all: clean
 	GOOS=darwin  GOARCH=amd64 go build -o $(DIST)/$(BINARY)-darwin-amd64 .
 	GOOS=darwin  GOARCH=arm64 go build -o $(DIST)/$(BINARY)-darwin-arm64 .
 	@echo "built:" && ls -1 $(DIST)
+
+# Read-only live checks against a running router. Spends nothing; pass
+# --spend/--claim to the script itself for the phases that cost MOR.
+live-test: build
+	bash scripts/live-test.sh
 
 clean:
 	rm -rf $(DIST) $(BINARY) $(BINARY).exe

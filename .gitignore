@@ -9,3 +9,6 @@
 
 # Router API credentials. Never commit.
 .cookie
+
+# Output from scripts/live-test.sh
+live-test-*.log
