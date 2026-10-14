@@ -22,12 +22,36 @@ curl -X POST http://localhost:8082/v1/chat/completions \
   -d '{"model":"...", "messages":[...]}'
 ```
 
-`morctl --dev` does both steps in one command, with the session ID captured in memory —
-no copy-pasting.
+`morctl --dev` does both steps in one command, with the session ID captured and cached —
+no copy-pasting, and the next run reuses the same session instead of staking for a new one.
+
+## morctl or mor-cli?
+
+**`mor-cli` is the official CLI** and ships as a prebuilt binary with every node
+release. Use it for **marketplace operations**: registering providers, models and bids,
+reading and approving allowances, browsing models interactively, chatting with a local
+model.
+
+**`morctl` is an operator tool for the session lifecycle and its failure modes.** Use it
+to open a session and run inference in one scriptable command, to see what sessions are
+open and what MOR they hold, to find and claim stake stuck on hold, and to diagnose why
+a session won't open.
+
+`morctl` deliberately does **not** duplicate provider/model/bid registration, wallet
+creation or local-model chat. If you need those, reach for `mor-cli`.
 
 ## Build
 
-Requires Go 1.21+.
+Requires Go 1.21+. No dependencies — the whole tool is standard library, so a plain
+`go build` needs no network access.
+
+```bash
+make build        # native binary
+make check        # go vet + go test
+make build-all    # all four supported targets into ./dist
+```
+
+Without `make`:
 
 **Linux/macOS (native):**
 ```bash
@@ -71,23 +95,126 @@ GOOS=darwin GOARCH=arm64 go build -o morctl .
 ./morctl
 ```
 
-**Developer flow** — opens a session and runs one inference call:
+**Diagnose** — check everything a session needs, in dependency order:
 ```bash
-./morctl --dev --prompt "Hello!"
+./morctl --diagnose
+```
+```
+> diagnosing http://localhost:8082
+
+  ✔ router                 healthy, v7.14.0, up 53h43m52s
+  ✔ component badgerdb     healthy, size=256.0MB
+  ✔ credentials            accepted (wallet 0xffd9883a...)
+  ✔ chain id               8453 (Base)
+  ✔ rpc endpoints          7 configured
+  ✔ rpc reachable          https://mainnet.base.org (chain 0x2105)
+  ✔ balance                5.0000 MOR, 0.0004 ETH
+  ✔ allowance              14.4820 MOR approved for the Diamond
+  ✔ stake on hold          none
+  ✔ model health           1 model(s) reporting, none unhealthy
+
+  No blocking problems found.
+```
+Each line is `✔` pass, `⚠` worth knowing, or `✖` blocking — and every `✖`/`⚠`
+carries a suggested fix. Exit code is 1 if anything is blocking, so it works in a script.
+
+It **doesn't stop at the first problem**: a rejected cookie shouldn't hide a wrong chain
+ID. The router and model-health checks use the unauthenticated `/healthcheck`, so they
+still report usefully when credentials are broken.
+
+**List models** — see what's on the marketplace (narrow with `--model`):
+```bash
+./morctl --list-models
+./morctl --list-models --model kimi
+```
+
+**Developer flow** — opens a session and runs one inference call. A model is
+required; `morctl` will not pick one for you, because opening a session stakes MOR:
+```bash
+./morctl --dev --model-id 0xbb9e920d... --prompt "Hello!"
+
+# or by name, which is resolved to an id (names are not unique, so an
+# ambiguous name is refused with the candidate ids listed):
+./morctl --dev --model kimi-k2.5 --prompt "Hello!"
 ```
 
 **Interactive** — keeps a session open across multiple prompts, with full conversation
 history resent each turn (the router does not retain context on its own — see
 [Notes](#notes)):
 ```bash
-./morctl --dev --interactive
+./morctl --dev --interactive --model-id 0xbb9e920d...
 ```
-Type `exit` or `quit` to end. The session's stake refunds automatically at its natural
-expiry — exiting the loop does not close it early.
+```
+> session live. Type a message, or /help for commands.
+
+[kimi-k2.5 · 9m35s left · 5.0000 MOR escrowed · 6 msg]
+you> what is 2+2?
+model> 4
+```
+Replies **stream** as they are generated (`--no-stream` waits for the whole reply). The
+status line above each prompt keeps the two facts that cost money — time left and stake
+escrowed — one line away.
+
+| Command | |
+|---|---|
+| `/help` | list the commands |
+| `/history` | print the conversation so far |
+| `/new` | start a new conversation on the **same** session (no new stake) |
+| `/model` | show the model, session and time remaining |
+| `/exit`, `/quit` | leave the chat (`exit`/`quit` also work) |
+
+An unrecognised `/command` is reported and **not** sent to the model, so a typo costs no
+tokens.
+
+Leaving the chat is a **local** act: the session stays open on-chain and its stake returns
+automatically at natural expiry, so there is no 24-hour on-hold penalty. Re-running the
+same command resumes both the session and the conversation.
+
+**Piped input works too** (non-TTY), with the prompts, status line and banner suppressed
+so the output is just the replies:
+```bash
+printf 'first question
+second question
+/exit
+' | ./morctl --dev --interactive --model-id 0x...
+```
+
+**Sessions** — list this wallet's recent sessions so overlapping ones are legible:
+```bash
+./morctl --sessions
+./morctl --sessions --resolve-names   # adds a ~30s marketplace fetch for model names
+```
+```
+> sessions for 0xffd9883a2245027b95a4f1801ac6b4e160b373e6
+
+  0x4c8e4022... LIVE    kimi-k2.5                        5.0000 MOR  7m12s left
+  0x2b5b7c29... closed  0xc8530921...                    5.6888 MOR  ended 2026-09-09 15:49
+
+  2 session(s) listed, 1 live, 5.0000 MOR escrowed in them.
+```
+Status is `LIVE` (usable now), `expired` (past its window, stake still returning) or
+`closed` (settled). The wallet address is read from the router, so you never have to
+supply it — unlike `mor-cli listBlockchainSession`, which requires `--user`.
+
+**Stake on hold** — MOR locked by sessions that closed early, and claiming it back:
+```bash
+./morctl --stakes                      # read-only
+./morctl --claim-stakes --confirm      # sends a transaction
+```
+Closing a session early doesn't refund immediately: the contract parks the refund in
+`userStakesOnHold` with a 24-hour lock (`releaseAt = closedAt + 1 day`). `--stakes` shows
+what is claimable now versus still locked; claimable stake is also flagged during
+preflight, since it's MOR you own that shows up nowhere else.
+
+`--claim-stakes` **requires `--confirm`** and, on a terminal, a typed confirmation. It
+refuses outright when there is nothing claimable rather than spending gas on a transaction
+the contract would revert. **The router's own wallet signs it** — `morctl` never reads,
+stores or transmits a private key. Needs node **v7.11.0+** (upstream issue #827); older
+routers get a clear message saying so.
 
 **Force a new session**, ignoring any cached one:
 ```bash
-./morctl --dev --fresh
+./morctl --dev --fresh --model-id 0xbb9e920d...
 ```
 
 ### Flags
@@ -95,22 +222,118 @@ expiry — exiting the loop does not close it early.
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `localhost:8082` | Router API host:port |
-| `--model` | `kimi-k2.5` | Model name for the completion request |
-| `--model-id` | *(kimi-k2.5's ID)* | On-chain model ID (`0x...`) |
+| `--model-id` | *(none — required)* | On-chain model ID (`0x` + 64 hex). Exact; preferred |
+| `--model` | *(none)* | Marketplace model name, resolved to an ID. Also narrows `--list-models` |
+| `--list-models` | off | List live marketplace models and exit |
 | `--prompt` | `"Hello!"` | Prompt to send in `--dev` mode |
 | `--duration` | `600` | Session duration in seconds |
 | `--dev` | off | Open a session and run inference |
 | `--interactive` | off | Multi-turn chat mode (implies `--dev`) |
 | `--fresh` | off | Ignore any cached session, open a new one |
+| `--no-history` | off | Don't store or restore conversation history in the cache |
 | `--json` | off | Also print raw request/response JSON |
+| `--verbose` | off | Show the raw router response alongside translated errors |
+| `--sessions` | off | List this wallet's recent sessions and exit |
+| `--resolve-names` | off | Show model names in `--sessions` (adds a ~30s fetch) |
+| `--stakes` | off | Show MOR stake on hold for this wallet and exit |
+| `--claim-stakes` | off | Withdraw releasable stake (needs `--confirm`; sends a transaction) |
+| `--confirm` | off | Confirm an action that sends a transaction |
+| `--diagnose` | off | Check router, credentials, chain, RPC, funds and model health |
+| `--no-stream` | off | In `--interactive`, wait for the whole reply instead of streaming |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
 
-## Session caching
+### No default model
 
-`morctl --dev` writes the opened session's ID and expiry to `.morctl-session.json` next to
-the binary. Subsequent runs against the same model reuse that session (if it still has
-enough time left) instead of opening — and staking for — a new one. Use `--fresh` to
+`--dev`, `--interactive` and `--prompt` require a model: pass `--model-id` (exact) or
+`--model` (a name, resolved against the marketplace). There is deliberately **no**
+default, because opening a session stakes MOR — a silent default meant staking against
+a model the user never named.
+
+Earlier versions defaulted to `kimi-k2.5`. **If you have scripts, aliases or guide steps
+that relied on that, add `--model-id 0xbb9e920d94ad3fa2861e1e209d0a969dbe9e1af1cf1ad95c49f76d7b63d32d93`
+explicitly.** Model names are not unique on the marketplace (58 of 517 live names were
+duplicated when this was written), so `--model <name>` refuses an ambiguous name and
+prints the candidate IDs instead of guessing. Whichever way the model is chosen, the run
+prints the name, the ID and where the choice came from before opening anything.
+
+## Session caching and conversation history
+
+`morctl --dev` writes the opened session's ID, model and expiry to `.morctl-session.json`
+next to the binary. Subsequent runs against the same model reuse that session (if it still
+has enough time left) instead of opening — and staking for — a new one. Use `--fresh` to
 bypass this.
+
+`--interactive` also stores the **conversation history** in that file, saved after every
+completed turn. Resuming a cached session restores the transcript, so the model still has
+the context of what was said in an earlier run — without this, reusing a session
+reconnected you to a model that had forgotten the conversation, since the router keeps no
+conversational state of its own (see [Notes](#notes)).
+
+- A new session always starts with empty history. `--fresh` opens a new session and starts
+  a new conversation.
+- A failed turn is not stored, so a rate-limit error doesn't leave a dangling question in
+  the transcript.
+- One-shot `--prompt` is deliberately stateless: it sends only that prompt, so scripted
+  runs stay reproducible. It leaves any stored history untouched.
+
+> **The cache file contains your conversation text.** It is written `0600` and is
+> gitignored. Pass `--no-history` to keep conversations out of it entirely (the session ID
+> is still cached, so session reuse keeps working).
+
+## Error messages
+
+Router failures are translated into a cause and a fix instead of a bare status line:
+
+```
+$ morctl --dev --model-id 0xbb9e920d...
+> opening session (model kimi-k2.5, 600s)...
+✖ the blockchain RPC endpoint is rate-limiting the router. The public Base RPCs are
+  shared and throttle quickly.
+  → Point the router at a dedicated RPC (ETH_NODE_ADDRESS, or POST /config/ethNode),
+    then retry.
+  (POST /blockchain/models/0xbb9e920d.../session -> 429 Too Many Requests; --verbose for
+   the full response)
+```
+
+Covered: RPC rate-limiting (429, or an `over rate limit` body behind a 500), a dead RPC
+endpoint (410 Gone), insufficient MOR to stake, no provider bids for the model, a provider
+disconnecting mid-session, rejected credentials (401, usually a `.cookie` regenerated by a
+router restart), missing permissions on a scoped user (403), a router too old for the stake
+endpoints (404), and a withdrawal already in flight (409).
+
+The **original error is never hidden**: `--verbose` or `--json` prints the raw response
+alongside the translation, and an error with no matching rule is printed verbatim rather
+than given an invented cause.
+
+## Testing
+
+```bash
+make check     # go vet + go test -- no router needed, nothing spent
+```
+
+The unit suite runs entirely against an `httptest` mock router, so **no test can open a
+session or spend MOR**.
+
+The paths that genuinely need a real session — opening one, reusing it, restoring its
+conversation across runs, and claiming stake back — live in a separate script:
+
+```bash
+./scripts/live-test.sh                 # read-only checks only; spends nothing
+./scripts/live-test.sh --spend         # + opens ONE session (stakes MOR)
+./scripts/live-test.sh --claim         # + withdraws claimable stake (sends a tx)
+./scripts/live-test.sh --make-onhold   # closes a session early to create
+                                       #   claimable stake -- 24h lock, opt-in
+```
+
+Nothing that costs money runs without the matching flag, **and** each phase prints what
+it is about to do and waits for you to type `yes` (`--yes` skips the prompts for an
+unattended run). The script records the wallet's MOR before and after, so the net spend
+is reported at the end, and writes a full transcript to `live-test-<stamp>.log`.
+
+> `--make-onhold` exists because stake only goes on hold after an **early** close, and
+> `morctl` never closes a session early. To exercise `--claim-stakes` for real you have
+> to deliberately accept the contract's 24-hour lock on the refund. It uses `mor-cli` to
+> do the close, since `morctl` has no close command and shouldn't grow one.
 
 ## Credentials
 
@@ -142,16 +365,21 @@ already running.
   with only the latest message will not have any memory of earlier turns. (This is
   confirmed intended behavior, not a bug — the client is responsible for turn/history
   management.)
-- **Session close vs. session end.** Typing `exit` in `--interactive` stops the local
-  loop only; it does not close the session on-chain. Your stake returns automatically
-  ~1 minute after the session's natural expiry, same as any Morpheus session. This
-  avoids the early-close on-hold penalty.
+- **Session close vs. session end.** Typing `exit` (or `/exit`) in `--interactive` stops
+  the local loop only; it does not close the session on-chain, and the tool says so
+  explicitly on the way out. Your stake returns automatically ~1 minute after the
+  session's natural expiry, same as any Morpheus session. This avoids the early-close
+  on-hold penalty — see [`--stakes`](#usage) for stake that *is* on hold.
 
 ## Known limitations / status
 
-- Tested against router v7.3.0 on Windows, against multiple models, with session reuse,
-  balance reporting, and graceful handling of router-down / invalid-model-ID /
+- Tested against router **v7.14.0** on Windows, against multiple models, with session
+  reuse, history restore across runs, balance and stake reporting, and graceful handling
+  of router-down / stale-cookie / invalid-model-ID / rate-limited-RPC /
   mid-session provider-disconnect failure cases.
+- `--claim-stakes` has been exercised against a mock router, **not** against a real
+  wallet with claimable stake. The guard paths (nothing claimable, missing `--confirm`)
+  are verified live.
 - macOS/Linux native builds compile cleanly but have not yet had the same depth of
   live testing as the Windows build — treat as expected-to-work, not yet as
   thoroughly verified.
@@ -159,12 +387,23 @@ already running.
   typically the router's admin cookie). For shared/multi-user setups, create a scoped
   `open_session`+`chat` user via the router's `/auth/users` endpoint and pass those
   credentials instead.
-- Health-check is router-level only (`/healthcheck`); it does not check individual
-  model/provider health.
+- Per-model/provider health is reported by `--diagnose`, from the `models[]` block the
+  router has exposed on `/healthcheck` since v7.5.0. It reflects the provider's own
+  self-report, not an independent probe by `morctl`.
 
 ## Roadmap
 
-A separate, future tool (`morpheus-doctor` v2) is planned to actually earn that name —
-install, diagnose, and repair Morpheus installations. See
-[REBRAND-AND-ROADMAP.md](./REBRAND-AND-ROADMAP.md) for the full scope. Not a current
-priority; `morctl` remains focused on session/inference operations.
+`morctl` has taken on the **diagnosis** half of what was planned as a separate
+`morpheus-doctor` v2 — `--diagnose` covers router, credentials, chain, RPC, funds and
+model health. What remains in that separate-tool plan is the part `morctl` deliberately
+won't do: **installing** Morpheus components and **repairing** broken installations
+(clearing corrupt local state, regenerating a stale cookie, resetting config). See
+[Rebrand & Roadmap](./Rebrand%20and%20roadmap.md) for that scope.
+
+Next candidates here, in rough order:
+
+- Scoped-user creation helper, so shared/booth setups don't need the admin cookie.
+- A real machine-readable `--json` output mode (today `--json` is a debug echo, not a
+  parseable document).
+- Repair actions behind explicit confirmation, starting with `POST /config/ethNode` to
+  replace a dead or rate-limited RPC — `--diagnose` already identifies that case.

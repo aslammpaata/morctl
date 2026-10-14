@@ -1,5 +1,18 @@
 # Rebrand & Roadmap
 
+> **Status (2026-10-13).** The rename is done: the GitHub repo is now
+> `aslammpaata/morctl`, the `go.mod` module path, binary names and session-cache
+> filename all match, and the old URL redirects. Step 6 below — the find-and-replace
+> across `windows-setup-guide.md`, `AUDIT.md`, `STATUS.md`, `booth-runbook.md`,
+> `demo-video-script.md` and the developer/headless guide — is **still outstanding**,
+> and now carries a second change with it: `morctl` no longer has a default model, so
+> any guide step running `--dev`/`--interactive` needs an explicit
+> `--model-id 0xbb9e920d94ad3fa2861e1e209d0a969dbe9e1af1cf1ad95c49f76d7b63d32d93`.
+>
+> Part 2 has partly shipped, in `morctl` rather than as a separate tool: `--diagnose`
+> now covers configuration and environment checking. **Install** and **repair** remain
+> unbuilt. See the revised status at the end of Part 2.
+
 ## Part 1 — Naming & Migration Guide
 
 ### Recommended new name: `morctl`
@@ -85,5 +98,19 @@ whenever it becomes a priority.
 
 ### Status
 
-Not a current priority. Tracked here so it isn't lost, and so `morctl`'s scope is
-understood as deliberately narrower by design, not by oversight.
+**Revised 2026-10-13.** Part of this has shipped inside `morctl` instead of waiting for
+a separate tool, because the diagnostic half needed no new architecture — it is reading
+endpoints the router already exposes.
+
+| Planned capability | Where it stands |
+|---|---|
+| Detect configuration issues | **Shipped** as `morctl --diagnose`: chain ID (expects 8453), RPC reachability and rate-limiting, stale cookie, allowance, balance, stake on hold, per-model health, badger store health |
+| Validate environment / runtime config | **Shipped**, same command — minus Go version and disk space, which aren't `morctl`'s business |
+| Install Morpheus components | **Not built.** Still the strongest case for a separate tool; `morctl` assumes a running router by design |
+| Repair broken installations | **Not built.** `--diagnose` identifies a dead or throttled RPC but only advises; the repair action (`POST /config/ethNode`) is a candidate behind explicit confirmation |
+| Bridge API-gateway and native/local deployments | **Not built** |
+
+What this means for the plan: a `morpheus-doctor` v2 would now be an **installer and
+repair tool**, not a diagnostic one. The diagnosis lives in `morctl` and is cheaper to
+keep there, next to the session code whose failures it explains. If v2 is ever built, it
+should call `morctl --diagnose` rather than reimplement it.
