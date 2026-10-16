@@ -325,6 +325,10 @@ conversation across runs, and claiming stake back — live in a separate script:
                                        #   claimable stake -- 24h lock, opt-in
 ```
 
+> It is a bash script. On Windows run it as `bash scripts/live-test.sh` — PowerShell
+> cannot execute a `.sh` file directly. [`scripts/MANUAL-TESTS.md`](./scripts/MANUAL-TESTS.md)
+> walks through the same checks by hand in PowerShell.
+
 Nothing that costs money runs without the matching flag, **and** each phase prints what
 it is about to do and waits for you to type `yes` (`--yes` skips the prompts for an
 unattended run). The script records the wallet's MOR before and after, so the net spend
@@ -377,9 +381,16 @@ already running.
   reuse, history restore across runs, balance and stake reporting, and graceful handling
   of router-down / stale-cookie / invalid-model-ID / rate-limited-RPC /
   mid-session provider-disconnect failure cases.
+- **Verified live on Base mainnet** (2026-10-16) via `scripts/live-test.sh`: 88 checks
+  across three runs, no failures. That included a real session opened against
+  `kimi-k2.5` (11.4289 MOR escrowed, returned at natural expiry), session reuse with no
+  second open, and conversation history restored across separate invocations — the model
+  recalled a name given in an earlier process. Read-only runs showed a net wallet change
+  of 0.0000 MOR.
 - `--claim-stakes` has been exercised against a mock router, **not** against a real
-  wallet with claimable stake. The guard paths (nothing claimable, missing `--confirm`)
-  are verified live.
+  wallet with claimable stake — nothing has been on hold to claim, because sessions are
+  left to expire naturally. Both guard paths (nothing claimable, missing `--confirm`) are
+  verified live: each exits non-zero and sends no transaction.
 - macOS/Linux native builds compile cleanly but have not yet had the same depth of
   live testing as the Windows build — treat as expected-to-work, not yet as
   thoroughly verified.
