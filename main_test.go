@@ -1332,8 +1332,13 @@ func TestInteractiveStreamingAndFarewell(t *testing.T) {
 		if !strings.Contains(out, "still OPEN") {
 			t.Errorf("farewell must say the session stays open, got:\n%s", out)
 		}
-		if !strings.Contains(out, "no 24h on-hold penalty") {
-			t.Errorf("farewell should explain why nothing was closed early, got:\n%s", out)
+		// It must explain the day lock without the old, incorrect claim that
+		// expiring naturally avoids it.
+		if !strings.Contains(out, "00:00 UTC") {
+			t.Errorf("farewell should say when held stake becomes claimable, got:\n%s", out)
+		}
+		if strings.Contains(out, "no 24h on-hold penalty") {
+			t.Errorf("farewell still claims natural expiry avoids the lock, got:\n%s", out)
 		}
 		if !strings.Contains(out, "5.0000 MOR") {
 			t.Errorf("farewell should name the escrowed stake, got:\n%s", out)
@@ -2077,7 +2082,7 @@ func TestClaimStakes(t *testing.T) {
 		if err == nil {
 			t.Fatal("want a refusal while the stake is still locked")
 		}
-		if !strings.Contains(err.Error(), "24h") {
+		if !strings.Contains(err.Error(), "releases") {
 			t.Errorf("the refusal should explain the lock, got: %v", err)
 		}
 		if called {
@@ -2085,17 +2090,50 @@ func TestClaimStakes(t *testing.T) {
 		}
 	})
 
-	t.Run("claims with --confirm on non-interactive stdin", func(t *testing.T) {
-		called := false
-		c := newRouter(t, "2500000000000000000", "0", &called)
-		// A file-backed stdin is not a terminal, so --confirm alone proceeds:
-		// this is the scripted path.
-		withStdin(t, "")
-		if err := claimStakes(c, config{claimStakes: true, confirm: true}); err != nil {
-			t.Fatal(err)
+	// --confirm is the only gate. An earlier version also demanded a typed
+	// "claim" on a terminal, which silently ate two real claim attempts: any
+	// wrapper that captures stdout hides the prompt while the command waits on
+	// stdin. This must proceed regardless of what stdin is.
+	t.Run("--confirm alone sends the withdrawal", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			stdin string
+		}{
+			{name: "empty stdin", stdin: ""},
+			{name: "stdin that does not say claim", stdin: "no\n"},
+			{name: "stdin with unrelated input", stdin: "hello\nworld\n"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				called := false
+				c := newRouter(t, "2500000000000000000", "0", &called)
+				withStdin(t, tc.stdin)
+				if err := claimStakes(c, config{claimStakes: true, confirm: true}); err != nil {
+					t.Fatalf("--confirm must be sufficient, got: %v", err)
+				}
+				if !called {
+					t.Error("the withdrawal should have been sent")
+				}
+			})
 		}
-		if !called {
-			t.Error("the withdrawal should have been sent")
+	})
+
+	t.Run("the refusal while still locked explains when it releases", func(t *testing.T) {
+		called := false
+		c := newRouter(t, "0", "2500000000000000000", &called)
+		err := claimStakes(c, config{claimStakes: true, confirm: true})
+		if err == nil {
+			t.Fatal("want a refusal while the stake is locked")
+		}
+		// The old wording said "24h lock", which is wrong: the release is
+		// pinned to the stipend epoch, not to 24 hours after the close.
+		if !strings.Contains(err.Error(), "00:00 UTC") {
+			t.Errorf("refusal should name the release time, got: %v", err)
+		}
+		if strings.Contains(err.Error(), "24h") {
+			t.Errorf("refusal still uses the incorrect 24h framing: %v", err)
+		}
+		if called {
+			t.Error("no transaction may be sent while locked")
 		}
 	})
 
@@ -2394,4 +2432,36 @@ func TestReachable(t *testing.T) {
 			t.Error("want a transport error against a closed server")
 		}
 	})
+}
+
+// TestNoIncorrectStakeLockWording guards the correction: the day lock is tied
+// to the stipend epoch, not to "24h after an early close". That wrong framing
+// shipped in five user-facing strings, and the on-chain evidence contradicts
+// it -- a session that reached its own endsAt still had its stake held until
+// 00:00 UTC the next day.
+func TestNoIncorrectStakeLockWording(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	for _, bad := range []string{
+		"expire naturally refund without a 24h lock",
+		"no 24h on-hold penalty",
+		"released 24h after an early close",
+		"still inside its 24h lock",
+	} {
+		if strings.Contains(text, bad) {
+			t.Errorf("main.go still contains the incorrect wording %q", bad)
+		}
+	}
+}
+
+// TestTimeoutFlag covers the deadline that made --sessions fail against a live
+// wallet: the chain-reading endpoints proxy to shared public RPCs, and 60s was
+// too tight.
+func TestTimeoutFlag(t *testing.T) {
+	if defaultTimeoutSec < 90 {
+		t.Errorf("defaultTimeoutSec = %d; /blockchain/sessions/user exceeded 60s on a live wallet", defaultTimeoutSec)
+	}
 }

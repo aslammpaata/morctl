@@ -79,7 +79,7 @@ field existed still load, falling back to the derived value.
 
 This was added after repeated manual testing kept opening redundant sessions
 for what was really the same ongoing test — each one staking MOR that then
-sat locked until natural expiry.
+sat escrowed until the session ended.
 
 ## Context handling
 
@@ -149,7 +149,7 @@ user to leave and re-run rather than doing it silently.
 
 **Leaving is explicit.** The farewell states that the session is still
 open, how long is left, how much is escrowed, and that nothing was closed
-early so there is no 24h on-hold penalty. "Session closed" would be both
+early, and when held stake becomes claimable. "Session closed" would be both
 wrong and expensive for a user to believe.
 
 **Non-TTY runs** (piped stdin, CI) suppress the prompt, status line and
@@ -246,12 +246,21 @@ such.
 
 ## Stake on hold, and claiming it
 
-Closing a session early does not refund the stake immediately: the
-contract pushes it into `userStakesOnHold` with
-`releaseAt = closedAt + 1 day` (`SessionRouter.sol`). That is the
-mechanism behind morctl's standing advice to let sessions expire
-naturally rather than closing them — and the reason MOR can appear to
-have vanished.
+Stake from a closed session does not return in full immediately. In
+`_rewardUserAfterClose` (`SessionRouter.sol`) the contract computes
+`releaseAt = startOfTheDay(min(closedAt, endsAt)) + 1 day` and holds back
+the portion drawn against that UTC day's stipend, returning the rest at
+once. So stake is day-locked until 00:00 UTC the following day.
+
+**This was documented wrongly here until 2026-10-25.** Earlier text called
+it an early-close penalty and claimed that letting a session expire
+naturally avoided it. It does not: a live session that reached its own
+`endsAt` on 2026-10-16 still had its 11.4289 MOR held until
+2026-10-17 00:00 UTC. The lock is tied to the stipend epoch, not to how
+the session ended. Letting a session expire avoids paying for unused
+time — a real saving, but a different one. Upstream's `AGENTS.md`
+rule 6 had it right as "day-locked used stipend"; this is now aligned
+with it.
 
 morctl reads `GET /blockchain/stakes/onhold` and can claim via
 `POST /blockchain/stakes/withdraw`. Both arrived in node **v7.11.0**
@@ -378,7 +387,7 @@ in `scripts/live-test.sh`, which is deliberately *not* part of `make check`:
 `--make-onhold` deserves its own note. Stake only goes on hold after an
 *early* close, and morctl never closes a session early — so the claim path
 is unreachable in normal operation. Making it testable means deliberately
-accepting the contract's 24h lock, which is a cost no script should impose
+forfeiting paid-for time, which is a cost no script should impose
 without being asked. It also uses `mor-cli` for the close, because morctl
 has no close command and should not grow one just to test a path.
 
