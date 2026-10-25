@@ -10,8 +10,10 @@
 #   Phase 1 (read-only)  runs by default and spends nothing.
 #   Phase 2 (--spend)    opens ONE session. This stakes MOR.
 #   Phase 3 (--claim)    withdraws claimable stake. This sends a transaction.
-#   Phase 4 (--make-onhold) closes a session EARLY to create claimable stake,
-#                        which locks the refund for 24h. Opt-in, separately.
+#   Phase 4 (--make-onhold) closes a session EARLY. NO LONGER NEEDED: stake is
+#                        day-locked on ANY close, so a normal session already
+#                        produces claimable stake at 00:00 UTC the next day.
+#                        Closing early only forfeits time you paid for.
 #
 # Nothing in phase 2-4 runs without the matching flag, and each prints what it
 # is about to do and waits for you to type 'yes'.
@@ -20,7 +22,7 @@
 #   ./scripts/live-test.sh                      # read-only checks
 #   ./scripts/live-test.sh --spend              # + open a session, run inference
 #   ./scripts/live-test.sh --spend --claim      # + claim stake if any is released
-#   ./scripts/live-test.sh --make-onhold        # create on-hold stake (24h lock)
+#   ./scripts/live-test.sh --make-onhold        # deprecated, see above
 #
 #   --model-id 0x...   model to use (default: kimi-k2.5)
 #   --host host:port   router API (default: localhost:8082)
@@ -99,7 +101,10 @@ run() {
   [ "$1" = "--" ] && shift
   log ""
   log "  \$ $*"
-  RUN_OUT="$("$@" 2>&1)"
+  # stdin from /dev/null: this helper captures stdout, so a command that
+  # stops to prompt would wait on input the user cannot see it asking for.
+  # That is exactly how two real --claim-stakes attempts were lost.
+  RUN_OUT="$("$@" 2>&1 </dev/null)"
   RUN_RC=$?
   printf '%s\n' "$RUN_OUT" | sed 's/^/      /' | tee -a "$LOG" >/dev/null
   printf '%s\n' "$RUN_OUT" | sed 's/^/      /'
@@ -277,8 +282,10 @@ if [ "$DO_SPEND" = "1" ]; then
   log ""
   log "  This opens ONE session against model:"
   log "    $MODEL_ID"
-  log "  for the default duration (600s), which stakes MOR until natural expiry."
-  log "  The session is NOT closed early, so there is no 24h on-hold penalty."
+  log "  for the default duration (600s), which escrows MOR until the session ends."
+  log "  When it ends, the stake drawn against that UTC day's stipend is held until"
+  log "  00:00 UTC the next day, then claimable with --claim-stakes --confirm."
+  log "  That day lock applies to any close, early or at natural expiry."
 
   if confirm "Open a real session and stake MOR?"; then
 
@@ -356,10 +363,12 @@ fi
 if [ "$DO_ONHOLD" = "1" ]; then
   head1 "PHASE 4 -- create claimable stake by closing a session EARLY"
   log ""
-  log "  morctl never closes a session early, by design: the contract parks the"
-  log "  refund in userStakesOnHold with releaseAt = closedAt + 1 day."
+  log "  NOTE: this phase is no longer necessary. Stake is day-locked on ANY"
+  log "  close -- releaseAt = startOfTheDay(sessionEnd) + 1 day -- so just letting"
+  log "  a session end gives you claimable stake at 00:00 UTC the next day."
+  log "  Closing early forfeits the time you paid for and gains nothing."
   log ""
-  log "  So to test the claim path you must deliberately accept that 24h lock."
+  log "  It is kept only so an old run can be reproduced; prefer letting a session end."
   log "  This step uses mor-cli (the official CLI) to close the session, because"
   log "  morctl has no close command and should not grow one."
   log ""
@@ -371,7 +380,7 @@ if [ "$DO_ONHOLD" = "1" ]; then
     skip "mor-cli not found (set MORCLI=/path/to/mor-cli) -- cannot close a session"
   elif [ -z "${SESSION_ID:-}" ]; then
     skip "no session id captured in this run -- run with --spend in the same invocation"
-  elif confirm "Close session ${SESSION_ID} early and accept a 24h lock on the refund?"; then
+  elif confirm "Close session ${SESSION_ID} early, forfeiting the time already paid for?"; then
     run "close the session" -- "$MORCLI" closeBlockchainSession --session "$SESSION_ID"
     log ""
     log "  Now wait ~24h, then run:  ./scripts/live-test.sh --claim"
@@ -414,8 +423,8 @@ if [ "$DO_CLAIM" = "1" ]; then
       expect_rc "succeeds" 0
       expect_out "reports a transaction hash" "tx:"
       log ""
-      log "  Waiting 45s for the transaction to confirm on Base..."
-      sleep 45
+      log "  Waiting 60s for the transaction to confirm on Base..."
+      sleep 60
       MOR_AFTER_CLAIM="$(mor_balance)"
       log "      MOR change across the claim: $(delta_wei "${MOR_BEFORE_CLAIM:-}" "${MOR_AFTER_CLAIM:-}")"
       run "stakes after claiming" -- "$MORCTL" --host "$HOST" --stakes

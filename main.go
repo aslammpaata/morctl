@@ -31,6 +31,13 @@ const (
 	lowMorWarningMOR  = 5.0 // heads-up threshold, not a hard block
 	sessionListLimit  = 20  // most recent sessions shown by --sessions
 	sessionSafetyMarg = 30 * time.Second
+	// defaultTimeoutSec covers the chain-reading endpoints, which proxy to
+	// shared public Base RPCs. Measured: /blockchain/balance intermittently
+	// takes 20s+, and /blockchain/sessions/user exceeded a 60s client timeout
+	// on a live wallet while the same call succeeded at 90s. 60s was too tight
+	// and surfaced as "context deadline exceeded", which reads like a router
+	// fault rather than our own deadline.
+	defaultTimeoutSec = 120
 	baseChainID       = int64(8453) // Base mainnet
 	baseChainIDHex    = "0x2105"    // 8453, as an RPC reports it
 )
@@ -57,6 +64,7 @@ type config struct {
 	confirm      bool
 	diagnose     bool
 	noStream     bool
+	timeoutSec   int
 	cacheFile    string
 }
 
@@ -90,8 +98,12 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.confirm, "confirm", false, "confirm an action that sends a transaction")
 	flag.BoolVar(&cfg.diagnose, "diagnose", false, "check router, credentials, chain, RPC, funds and model health, then exit")
 	flag.BoolVar(&cfg.noStream, "no-stream", false, "in --interactive, wait for the whole reply instead of streaming it")
+	flag.IntVar(&cfg.timeoutSec, "timeout", defaultTimeoutSec, "HTTP timeout in seconds for router calls")
 	flag.Parse()
-	cfg.timeout = 60 * time.Second
+	if cfg.timeoutSec <= 0 {
+		cfg.timeoutSec = defaultTimeoutSec
+	}
+	cfg.timeout = time.Duration(cfg.timeoutSec) * time.Second
 	cfg.cacheFile = sessionCacheFile
 	return cfg
 }
@@ -748,11 +760,21 @@ func showSessions(c *client, cfg config) error {
 
 // stakesOnHold is GET /blockchain/stakes/onhold. Both figures are wei strings.
 //
-// Available is stake whose 24h lock has elapsed and can be withdrawn now;
-// Hold is stake still inside that window. The lock exists because closing a
-// session early pushes the refund into userStakesOnHold with a releaseAt of
-// closedAt + 1 day (SessionRouter.sol) -- which is exactly why morctl lets
-// sessions expire naturally rather than closing them.
+// Available is stake past its release time and withdrawable now; Hold is stake
+// still waiting.
+//
+// The lock is tied to the stipend epoch, not to closing early. On any close,
+// _rewardUserAfterClose computes
+//
+//	releaseAt = startOfTheDay(min(closedAt, endsAt)) + 1 day
+//
+// and holds back the portion of stake drawn against that UTC day's stipend,
+// returning the rest immediately (SessionRouter.sol). So stake is day-locked
+// until 00:00 UTC the following day whether the session was closed early or
+// ran to its natural end -- confirmed on chain: a session that reached its own
+// endsAt on 2026-10-16 still had its 11.4289 MOR held until 2026-10-17 00:00
+// UTC. Letting a session expire avoids paying for time you did not use; it
+// does not avoid the day lock.
 type stakesOnHold struct {
 	Available string `json:"available"`
 	Hold      string `json:"hold"`
@@ -803,9 +825,12 @@ func showStakes(c *client, cfg config) error {
 	case s.claimable():
 		fmt.Println("\n  Claim it with:  morctl --claim-stakes --confirm")
 	case s.Hold != "" && s.Hold != "0":
-		fmt.Println("\n  Locked stake is released 24h after the session that produced it closed early.")
+		fmt.Println("\n  Locked stake releases at 00:00 UTC the day after the session ended.")
+		fmt.Println("  This applies to any close, early or at natural expiry: the portion drawn")
+		fmt.Println("  against that day's stipend is held until the epoch rolls over.")
 	default:
-		fmt.Println("\n  Nothing on hold. Sessions left to expire naturally refund without a 24h lock.")
+		fmt.Println("\n  Nothing on hold. Stake from a closed session is held until 00:00 UTC the")
+		fmt.Println("  day after it ended, then becomes claimable here.")
 	}
 	return nil
 }
@@ -827,7 +852,7 @@ func claimStakes(c *client, cfg config) error {
 	if !s.claimable() {
 		fmt.Println()
 		if s.Hold != "" && s.Hold != "0" {
-			return errors.New("nothing to claim yet: the stake on hold is still inside its 24h lock")
+			return errors.New("nothing to claim yet: the stake on hold releases at 00:00 UTC the day after the session ended")
 		}
 		return errors.New("nothing to claim: this wallet has no stake on hold")
 	}
@@ -839,14 +864,14 @@ func claimStakes(c *client, cfg config) error {
 
 	// On a terminal, make the person say it out loud. Piped input (CI, scripts)
 	// is taken as already deliberate, since --confirm had to be passed.
-	if isTerminal(os.Stdin) {
-		fmt.Printf("\n  This sends a transaction from the router's wallet and costs gas.\n")
-		fmt.Printf("  Type 'claim' to withdraw %s MOR: ", formatWei(s.Available))
-		scanner := bufio.NewScanner(os.Stdin)
-		if !scanner.Scan() || strings.TrimSpace(scanner.Text()) != "claim" {
-			return errors.New("cancelled -- nothing was sent")
-		}
-	}
+	// --confirm is the gate, and it is the only one. An earlier version also
+	// demanded a typed "claim" on a terminal; that second gate cost two real
+	// claim attempts, because any wrapper capturing stdout hides the prompt
+	// while the command sits waiting on stdin. One explicit flag is enough for
+	// a command that reclaims the user's own funds, where the worst case of an
+	// accidental run is the gas.
+	fmt.Printf("\n  Claiming %s MOR. This sends a transaction from the router's wallet and costs gas.\n",
+		formatWei(s.Available))
 
 	fmt.Println("\n> withdrawing stake...")
 	tx, err := c.withdrawStakes()
@@ -1172,7 +1197,7 @@ func runChecks(c *client, cfg config) *report {
 		} else if s.claimable() {
 			r.warn("stake on hold", formatWei(s.Available)+" MOR claimable", "Claim it: morctl --claim-stakes --confirm")
 		} else if s.any() {
-			r.ok("stake on hold", formatWei(s.Hold)+" MOR locked (released 24h after an early close)")
+			r.ok("stake on hold", formatWei(s.Hold)+" MOR locked (releases 00:00 UTC after the session's end day)")
 		} else {
 			r.ok("stake on hold", "none")
 		}
@@ -1691,11 +1716,11 @@ func (u *chatUI) farewell() {
 	fmt.Fprintf(u.out, "\n✅ left the chat. The session is still OPEN on-chain.\n")
 	fmt.Fprintf(u.out, "   session: %s (%s remaining)\n", short(u.id), remaining(u.exp))
 	if u.escrow != "" {
-		fmt.Fprintf(u.out, "   %s MOR stays escrowed and returns automatically at natural expiry.\n", formatWei(u.escrow))
-	} else {
-		fmt.Fprintf(u.out, "   The stake returns automatically at natural expiry.\n")
+		fmt.Fprintf(u.out, "   %s MOR stays escrowed while it runs.\n", formatWei(u.escrow))
 	}
-	fmt.Fprintf(u.out, "   Nothing was closed early, so there is no 24h on-hold penalty.\n")
+	fmt.Fprintf(u.out, "   Leaving the chat closes nothing, so you keep the time you paid for.\n")
+	fmt.Fprintf(u.out, "   After it ends, stake drawn against that day's stipend is held until\n")
+	fmt.Fprintf(u.out, "   00:00 UTC the next day, then claimable with --claim-stakes --confirm.\n")
 	if !u.cfg.noHistory {
 		fmt.Fprintf(u.out, "   Re-run the same command to resume this session and conversation.\n")
 	}

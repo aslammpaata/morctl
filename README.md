@@ -167,7 +167,7 @@ An unrecognised `/command` is reported and **not** sent to the model, so a typo 
 tokens.
 
 Leaving the chat is a **local** act: the session stays open on-chain and its stake returns
-automatically at natural expiry, so there is no 24-hour on-hold penalty. Re-running the
+held until 00:00 UTC the day after it ends, then claimable. Re-running the
 same command resumes both the session and the conversation.
 
 **Piped input works too** (non-TTY), with the prompts, status line and banner suppressed
@@ -201,10 +201,16 @@ supply it — unlike `mor-cli listBlockchainSession`, which requires `--user`.
 ./morctl --stakes                      # read-only
 ./morctl --claim-stakes --confirm      # sends a transaction
 ```
-Closing a session early doesn't refund immediately: the contract parks the refund in
-`userStakesOnHold` with a 24-hour lock (`releaseAt = closedAt + 1 day`). `--stakes` shows
-what is claimable now versus still locked; claimable stake is also flagged during
-preflight, since it's MOR you own that shows up nowhere else.
+Stake from a closed session doesn't come straight back. On **any** close, the contract
+holds the portion drawn against that UTC day's stipend until
+`releaseAt = startOfTheDay(sessionEnd) + 1 day` — i.e. 00:00 UTC the next day —
+and returns the rest immediately. `--stakes` shows what is claimable now versus still
+waiting; claimable stake is also flagged during preflight, since it's MOR you own that
+shows up nowhere else.
+
+This is **not** an early-close penalty. Confirmed on chain: a session that ran to its own
+`endsAt` on 2026-10-16 still had its 11.4289 MOR held until 2026-10-17 00:00 UTC. Letting
+a session expire avoids paying for time you didn't use; it does not avoid the day lock.
 
 `--claim-stakes` **requires `--confirm`** and, on a terminal, a typed confirmation. It
 refuses outright when there is nothing claimable rather than spending gas on a transaction
@@ -322,7 +328,7 @@ conversation across runs, and claiming stake back — live in a separate script:
 ./scripts/live-test.sh --spend         # + opens ONE session (stakes MOR)
 ./scripts/live-test.sh --claim         # + withdraws claimable stake (sends a tx)
 ./scripts/live-test.sh --make-onhold   # closes a session early to create
-                                       #   claimable stake -- 24h lock, opt-in
+                                       #   deprecated: see note below
 ```
 
 > It is a bash script. On Windows run it as `bash scripts/live-test.sh` — PowerShell
@@ -334,10 +340,10 @@ it is about to do and waits for you to type `yes` (`--yes` skips the prompts for
 unattended run). The script records the wallet's MOR before and after, so the net spend
 is reported at the end, and writes a full transcript to `live-test-<stamp>.log`.
 
-> `--make-onhold` exists because stake only goes on hold after an **early** close, and
-> `morctl` never closes a session early. To exercise `--claim-stakes` for real you have
-> to deliberately accept the contract's 24-hour lock on the refund. It uses `mor-cli` to
-> do the close, since `morctl` has no close command and shouldn't grow one.
+> `--make-onhold` is **deprecated and unnecessary**. It was written on the belief that
+> stake only goes on hold after an early close. It doesn't: any close day-locks the
+> stipend portion, so an ordinary session already leaves claimable stake at 00:00 UTC the
+> next day. Closing early only forfeits time you paid for.
 
 ## Credentials
 
@@ -371,9 +377,10 @@ already running.
   management.)
 - **Session close vs. session end.** Typing `exit` (or `/exit`) in `--interactive` stops
   the local loop only; it does not close the session on-chain, and the tool says so
-  explicitly on the way out. Your stake returns automatically ~1 minute after the
-  session's natural expiry, same as any Morpheus session. This avoids the early-close
-  on-hold penalty — see [`--stakes`](#usage) for stake that *is* on hold.
+  explicitly on the way out. Once the session does end, the stake drawn against that UTC
+  day's stipend is held until 00:00 UTC the next day and then claimable via
+  [`--stakes`](#usage) / `--claim-stakes`. That day lock applies to any close, early or
+  at natural expiry.
 
 ## Known limitations / status
 
@@ -383,7 +390,8 @@ already running.
   mid-session provider-disconnect failure cases.
 - **Verified live on Base mainnet** (2026-10-16) via `scripts/live-test.sh`: 88 checks
   across three runs, no failures. That included a real session opened against
-  `kimi-k2.5` (11.4289 MOR escrowed, returned at natural expiry), session reuse with no
+  `kimi-k2.5` (11.4289 MOR escrowed, day-locked on close and released at 2026-10-17
+  00:00 UTC as the contract specifies), session reuse with no
   second open, and conversation history restored across separate invocations — the model
   recalled a name given in an earlier process. Read-only runs showed a net wallet change
   of 0.0000 MOR.
