@@ -131,12 +131,28 @@ Only if you want the full `--dev` path on a real session. Read
 [`../upstream-patches/VERIFY-LIVE.md`](../upstream-patches/VERIFY-LIVE.md) first for the
 cost model; the short version:
 
-- Your allowance to the Diamond is the binding limit, and it is **consumed** per open.
-- Use a **single-bid** model so the stake is deterministic. `qwen3-30b-a3b` at
-  `--duration 120` escrows ~1.889 MOR.
+- **Your MOR balance is the binding limit, not your allowance.** The router tops
+  the allowance up on demand: if it is below `stake × 3`
+  (`allowanceReserveMultiplier`), the router calls `increaseAllowance(stake)`
+  before opening, and the contract's `safeTransferFrom` then draws it back down.
+  Measured on a real open: allowance 10.5190 → 10.5190 (unchanged), balance
+  20.0000 → 11.1740. A zero allowance is therefore not a blocker.
+- **Never go below 300 seconds.** The contract's `MIN_SESSION_DURATION` is
+  5 minutes; below it `openSession` reverts with `SessionTooShort` and the gas is
+  spent for nothing. 600s is the shortest length worth using and is also
+  `mor-cli`'s default. Every session this wallet has ever opened was ≥ 599s.
+- Use a **single-bid** model so the stake is deterministic, and quote the stake
+  fresh rather than trusting a number in a doc — prices move:
+
+```bash
+AUTH=$(cat "/c/Users/ADMIN/AppData/Roaming/morpheus-app/services/.cookie") && curl -s -u "$AUTH" "http://localhost:8082/blockchain/models/<MODEL_ID>/session/estimate?sessionDuration=600" | python -m json.tool
+```
+
+That endpoint is read-only — it opens nothing. Stake scales linearly with
+duration, so a 600s session costs 5× a (hypothetical) 120s one.
 
 ```powershell
-.\morctl.exe --dev --fresh --duration 120 `
+.\morctl.exe --dev --fresh --duration 600 `
   --model-id 0x93c1c300f2eca67c61d80f28e5ae44cb9d6b64c5cfa70db8ec92ed180d86414a `
   --prompt "Reply with exactly: live-ok"
 ```
@@ -147,7 +163,7 @@ reply, and the time remaining.
 Then, to confirm reuse and history (free — reuses that session):
 
 ```powershell
-.\morctl.exe --dev --duration 120 `
+.\morctl.exe --dev --duration 600 `
   --model-id 0x93c1c300f2eca67c61d80f28e5ae44cb9d6b64c5cfa70db8ec92ed180d86414a `
   --prompt "second turn"
 ```
@@ -157,7 +173,7 @@ Then, to confirm reuse and history (free — reuses that session):
 And interactive, with history persisting across runs:
 
 ```powershell
-.\morctl.exe --dev --interactive --duration 120 `
+.\morctl.exe --dev --interactive --duration 600 `
   --model-id 0x93c1c300f2eca67c61d80f28e5ae44cb9d6b64c5cfa70db8ec92ed180d86414a
 ```
 
