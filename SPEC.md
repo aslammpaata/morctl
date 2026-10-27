@@ -244,6 +244,34 @@ since v7.5.0, which neither CLI previously surfaced. It is the
 provider's self-report, not an independent probe, and it is reported as
 such.
 
+**The allowance is reported, not judged.** An earlier version failed the
+report when the allowance to the Diamond was zero, and told the user to
+go and approve some. That was wrong. Before opening, the router raises
+the allowance itself whenever it sits below `stake × 3`
+(`allowanceReserveMultiplier`), starting from whatever is already
+there — zero included. Measured across one real open: the allowance went
+10.5190 → 10.5190 while the balance fell by the whole stake. **The
+balance is the binding limit, not the allowance**, so a zero allowance
+is reported as a pass that notes the router approves on demand. The
+only thing it actually costs is one extra approval transaction's gas.
+
+## Session duration floor
+
+`MIN_SESSION_DURATION` in the SessionRouter facet is five minutes. The
+contract derives a session's length from the staked amount and reverts
+as `SessionTooShort` below it — after the stake has been priced and the
+transaction signed, so the gas is lost. Nothing in the router checks
+this first, which makes it the client's job.
+
+`--duration` under 300 is therefore rejected before the marketplace is
+queried, and **rejected rather than clamped**: duration and stake move
+together, so silently raising one spends more of the user's MOR than
+they asked to commit. Between 300 and `defaultDuration` the request is
+allowed with a note, because those lengths are legal on chain but
+providers set their own minimum session cost and may refuse them
+anyway. 600s is the shortest length observed to open successfully on
+Base mainnet, which is why it is the default.
+
 ## Stake on hold, and claiming it
 
 Stake from a closed session does not return in full immediately. In

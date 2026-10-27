@@ -232,7 +232,7 @@ routers get a clear message saying so.
 | `--model` | *(none)* | Marketplace model name, resolved to an ID. Also narrows `--list-models` |
 | `--list-models` | off | List live marketplace models and exit |
 | `--prompt` | `"Hello!"` | Prompt to send in `--dev` mode |
-| `--duration` | `600` | Session duration in seconds |
+| `--duration` | `600` | Session duration in seconds. Minimum **300** — see below |
 | `--dev` | off | Open a session and run inference |
 | `--interactive` | off | Multi-turn chat mode (implies `--dev`) |
 | `--fresh` | off | Ignore any cached session, open a new one |
@@ -247,6 +247,32 @@ routers get a clear message saying so.
 | `--diagnose` | off | Check router, credentials, chain, RPC, funds and model health |
 | `--no-stream` | off | In `--interactive`, wait for the whole reply instead of streaming |
 | `--cookie` | `./.cookie` | Path to the router `.cookie` file |
+
+### Session duration has a floor, and it is enforced on chain
+
+`MIN_SESSION_DURATION` in the SessionRouter facet is **5 minutes**. The contract
+works out a session's length from the amount staked and reverts as
+`SessionTooShort` below that — *after* the stake has been priced and the
+transaction signed, so the gas is spent for nothing. Nothing in the router
+checks this first.
+
+So `--duration` below 300 is rejected outright, before the marketplace is even
+queried:
+
+```
+✖ --duration 120 is below the contract minimum of 300s, so the open would
+  revert on chain as SessionTooShort and the gas would be lost: use 300 or
+  more (600 is the default)
+```
+
+It is rejected rather than quietly raised, because raising the duration raises
+the stake in proportion — opening a longer, dearer session than you asked for is
+the worse surprise.
+
+Between 300 and 600 you get a note and the run continues: those lengths are
+legal on chain, but providers set their own minimum session cost and may still
+refuse. 600s is the shortest length we have actually observed open on Base
+mainnet, which is why it is the default.
 
 ### No default model
 

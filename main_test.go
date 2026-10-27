@@ -1836,15 +1836,22 @@ func TestDiagnoseFailures(t *testing.T) {
 		}
 	})
 
-	t.Run("a zero allowance is a failure", func(t *testing.T) {
+	// A zero allowance used to be reported as a failure. It is not one: the
+	// router raises the allowance on demand before opening, from zero if that
+	// is where it starts, so the old check sent people to approve MOR they did
+	// not need to approve.
+	t.Run("a zero allowance is not a failure", func(t *testing.T) {
 		rpc := rpcServer(t, okRPC("0x2105"))
 		routes := healthyRoutes(rpc)
 		routes["GET /blockchain/allowance"] = jsonRoute(`{"allowance":"0"}`)
 		c, _ := newMockRouter(t, routes)
 		r := runChecks(c, config{})
 		chk, _ := r.find("allowance")
-		if chk.state != "fail" {
-			t.Errorf("allowance check = %+v, want fail at 0", chk)
+		if chk.state != "ok" {
+			t.Errorf("allowance check = %+v, want ok at 0", chk)
+		}
+		if !strings.Contains(chk.detail, "on demand") {
+			t.Errorf("a zero allowance should say the router approves on demand, got %q", chk.detail)
 		}
 	})
 
@@ -2463,5 +2470,76 @@ func TestNoIncorrectStakeLockWording(t *testing.T) {
 func TestTimeoutFlag(t *testing.T) {
 	if defaultTimeoutSec < 90 {
 		t.Errorf("defaultTimeoutSec = %d; /blockchain/sessions/user exceeded 60s on a live wallet", defaultTimeoutSec)
+	}
+}
+
+// TestCheckDurationRejectsBelowTheContractMinimum guards the gas-wasting case.
+//
+// The contract derives a session's length from the staked amount and reverts as
+// SessionTooShort below MIN_SESSION_DURATION. Nothing in the router checks it
+// first, so a shorter request is priced, signed and sent, and the gas is spent
+// on a revert. Observed live: every --duration 120 open failed this way.
+func TestCheckDurationRejectsBelowTheContractMinimum(t *testing.T) {
+	for _, secs := range []int{1, 60, 120, 299} {
+		note, err := checkDuration(secs)
+		if err == nil {
+			t.Errorf("checkDuration(%d) should be rejected: the chain reverts below %ds", secs, minSessionDuration)
+			continue
+		}
+		if note != "" {
+			t.Errorf("checkDuration(%d) returned both a note %q and an error", secs, note)
+		}
+		for _, want := range []string{"300", "SessionTooShort", "gas"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("checkDuration(%d) error should mention %q, got: %v", secs, want, err)
+			}
+		}
+	}
+}
+
+func TestCheckDurationRejectsNonPositive(t *testing.T) {
+	for _, secs := range []int{0, -1, -600} {
+		if _, err := checkDuration(secs); err == nil {
+			t.Errorf("checkDuration(%d) should be rejected", secs)
+		}
+	}
+}
+
+// TestCheckDurationNotesProviderMinimums covers the band that is legal on chain
+// but may still be refused by a provider's own minimum session cost.
+func TestCheckDurationNotesProviderMinimums(t *testing.T) {
+	for _, secs := range []int{300, 450, 599} {
+		note, err := checkDuration(secs)
+		if err != nil {
+			t.Errorf("checkDuration(%d) clears the contract minimum, should not be rejected: %v", secs, err)
+		}
+		if note == "" {
+			t.Errorf("checkDuration(%d) should note that providers may refuse it", secs)
+		}
+	}
+}
+
+// TestCheckDurationAcceptsTheDefaultSilently: 600s is the shortest length
+// observed to open successfully, so it earns no note.
+func TestCheckDurationAcceptsTheDefaultSilently(t *testing.T) {
+	for _, secs := range []int{defaultDuration, 601, 900, 3600} {
+		note, err := checkDuration(secs)
+		if err != nil {
+			t.Errorf("checkDuration(%d) should be accepted: %v", secs, err)
+		}
+		if note != "" {
+			t.Errorf("checkDuration(%d) should pass without a note, got %q", secs, note)
+		}
+	}
+}
+
+// TestDurationFloorMatchesTheContract pins the constant to the on-chain value.
+// MIN_SESSION_DURATION is `5 minutes` in SessionStorage.sol.
+func TestDurationFloorMatchesTheContract(t *testing.T) {
+	if minSessionDuration != 300 {
+		t.Errorf("minSessionDuration = %d, want 300 (MIN_SESSION_DURATION, 5 minutes)", minSessionDuration)
+	}
+	if defaultDuration < minSessionDuration {
+		t.Errorf("the default duration %d is below the contract minimum %d", defaultDuration, minSessionDuration)
 	}
 }

@@ -40,6 +40,12 @@ const (
 	defaultTimeoutSec = 120
 	baseChainID       = int64(8453) // Base mainnet
 	baseChainIDHex    = "0x2105"    // 8453, as an RPC reports it
+	// minSessionDuration is MIN_SESSION_DURATION in the SessionRouter facet,
+	// five minutes. The contract derives a session's length from the staked
+	// amount and reverts as SessionTooShort below it. Nothing in the router
+	// checks this first, so a shorter request is priced, signed and sent, and
+	// the gas is spent on a revert.
+	minSessionDuration = 300
 )
 
 type config struct {
@@ -106,6 +112,36 @@ func parseFlags() config {
 	cfg.timeout = time.Duration(cfg.timeoutSec) * time.Second
 	cfg.cacheFile = sessionCacheFile
 	return cfg
+}
+
+// checkDuration rejects a session length the chain will refuse, and returns a
+// note for one that is legal but still unwise.
+//
+// This rejects rather than clamping. Raising the duration raises the stake
+// proportionally, and that is the caller's MOR to commit -- silently opening a
+// longer, dearer session than they asked for is the worse failure.
+//
+// Between minSessionDuration and defaultDuration the open is legal on chain,
+// but providers set their own minimum session cost and may refuse it. 600s is
+// the shortest length observed to open successfully against Base mainnet, so
+// below it the caller gets a note rather than a block.
+func checkDuration(seconds int) (note string, err error) {
+	switch {
+	case seconds <= 0:
+		return "", fmt.Errorf("--duration must be positive, got %d", seconds)
+	case seconds < minSessionDuration:
+		return "", fmt.Errorf(
+			"--duration %d is below the contract minimum of %ds, so the open would revert "+
+				"on chain as SessionTooShort and the gas would be lost: use %d or more "+
+				"(%d is the default)",
+			seconds, minSessionDuration, minSessionDuration, defaultDuration)
+	case seconds < defaultDuration:
+		return fmt.Sprintf(
+			"%ds clears the %ds contract minimum, but providers set their own minimum "+
+				"session cost and may refuse it; %ds is the shortest length observed to open",
+			seconds, minSessionDuration, defaultDuration), nil
+	}
+	return "", nil
 }
 
 func cookieDefault() string {
@@ -1172,13 +1208,19 @@ func runChecks(c *client, cfg config) *report {
 				var a struct {
 					Allowance json.Number `json:"allowance"`
 				}
+				// A zero allowance is not a failure, and reporting it as one sent
+				// people off to approve MOR they did not need to approve. Before
+				// opening, the router tops the allowance up whenever it is below
+				// stake x 3 (allowanceReserveMultiplier), starting from whatever
+				// is already there -- zero included. Measured across one real
+				// open: the allowance went 10.5190 -> 10.5190 while the balance
+				// fell by the full stake. The balance is the binding limit.
 				if err := c.do(http.MethodGet, "/blockchain/allowance?spender="+diamond, nil, nil, &a); err != nil {
 					r.warn("allowance", "unavailable", "Sessions need an allowance for the Diamond contract.")
-				} else if a.Allowance.String() == "0" || a.Allowance.String() == "" {
-					r.fail("allowance", "0 MOR approved for the Diamond contract",
-						"Approve an allowance before opening sessions (mor-cli approveAllowance, or the Desktop App).")
+				} else if v := a.Allowance.String(); v == "0" || v == "" {
+					r.ok("allowance", "none standing; the router approves on demand before opening")
 				} else {
-					r.ok("allowance", formatWei(a.Allowance.String())+" MOR approved for the Diamond")
+					r.ok("allowance", formatWei(v)+" MOR approved for the Diamond")
 				}
 			}
 		}
@@ -1411,6 +1453,17 @@ func saveSessionCache(path string, s sessionCache) {
 // hands off to the interactive loop -- replacing the manual open-session /
 // copy-id / run-inference chain (AUDIT F3/F4).
 func devFlow(c *client, cfg config) error {
+	// Check the duration before resolving the model or opening anything: an
+	// unusable value should not cost a marketplace fetch to find out about,
+	// let alone a reverted transaction.
+	note, err := checkDuration(cfg.duration)
+	if err != nil {
+		return err
+	}
+	if note != "" {
+		fmt.Printf("\n  note: %s\n", note)
+	}
+
 	// Resolve the model before anything else: this is the step that used to
 	// fall back to a hardcoded default, quietly staking MOR against a model
 	// the user never named.
